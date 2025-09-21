@@ -3,14 +3,6 @@ include("libportaudio.jl")
 using .LibPortAudio
 using DifferentialEquations
 using Atomix: @atomic, @atomicswap
-using Base.Threads
-
-mutable struct RBAudio
-    buf::Vector{Float32}
-    mask::Int
-    w::Atomic{Int}
-    r::Atomic{Int}
-end
 
 mutable struct RealTimeAudioDEControlData
 	@atomic u0::Vector{Float64}
@@ -39,12 +31,6 @@ mutable struct RealTimeAudioDEData
 	control::RealTimeAudioDEControlData
 	state::RealTimeAudioDEStateData
 	stream_data::RealTimeAudioDEStreamData
-	 # --- NEW ---
-    G::Matrix{Float32}                       # normalized gain matrix (nvars × n_channels)
-    rb::Union{RBAudio, Nothing}              # ring buffer for inter-thread audio samples
-    producer::Union{Task, Nothing}           # background integrator task
-    integrator::Any                          # ODE/SDE integrator (init(...) result)
-    running::Atomic{Bool}                    # run flag for producer
 end
 
 #! export
@@ -53,71 +39,6 @@ mutable struct DESource
 	callback::Base.CFunction
 end
 
-function RBAudio(n::Integer)
-    N = 1 << (ceil(Int, log2(max(n, 1024))))     # next power of two, >= 1024
-    RBAudio(zeros(Float32, N), N-1, Atomic{Int}(0), Atomic{Int}(0))
-end
-
-@inline rb_capacity(rb::RBAudio) = length(rb.buf)
-@inline rb_available_to_write(rb::RBAudio) = rb_capacity(rb) - (rb.w[] - rb.r[])
-@inline rb_available_to_read(rb::RBAudio)  = rb.w[] - rb.r[]
-@inline rb_is_empty(rb::RBAudio) = rb.w[] == rb.r[]
-@inline rb_is_full(rb::RBAudio)  = rb_available_to_write(rb)
-
-# pop up to n samples; returns number popped
-function rb_pop!(rb::RBAudio, out::Ptr{Cfloat}, n::Int)
-    avail = rb_available_to_read(rb)
-    m = min(avail, n)
-    if m <= 0
-        return 0
-    end
-    ri = rb.r[] & rb.mask
-    tail = min(m, rb_capacity(rb) - ri)
-    # first chunk
-    @inbounds unsafe_copyto!(out, 1, pointer(rb.buf, ri+1), tail)
-    # wrap chunk
-    if tail < m
-        @inbounds unsafe_copyto!(out, tail+1, pointer(rb.buf, 1), m - tail)
-    end
-    rb.r[] = rb.r[] + m
-    return m
-end
-
-# push 1 sample (caller checks space)
-@inline function rb_push!(rb::RBAudio, x::Float32)
-    wi = rb.w[] & rb.mask
-    @inbounds rb.buf[wi+1] = x
-    rb.w[] = rb.w[] + 1
-    nothing
-end
-
-# ========== Channel map normalization to a gain matrix ==========
-function normalize_channel_map(channel_map, nvars::Int, nch::Int)::Matrix{Float32}
-    G = zeros(Float32, nvars, nch)
-    if channel_map isa Vector{Int}
-        for (ch, var) in enumerate(channel_map[1:min(end, nch)])
-            if 1 <= var <= nvars
-                G[var, ch] = 1f0
-            end
-        end
-    elseif channel_map isa Vector{Vector{Int}}
-        for ch in 1:nch
-            ch > length(channel_map) && break
-            for var in channel_map[ch]
-                if 1 <= var <= nvars
-                    G[var, ch] += 1f0
-                end
-            end
-        end
-    elseif channel_map isa AbstractMatrix
-        @inbounds for ch in 1:nch, k in 1:min(nvars, size(channel_map,1))
-            G[k, ch] = Float32(channel_map[k, ch])
-        end
-    else
-        error("Unsupported channel_map type")
-    end
-    return G
-end
 
 #! export
 # ODE
@@ -207,45 +128,9 @@ function _DESource(prob::DEProblem, alg, channel_map)::DESource
 
 	stream = RealTimeAudioDEStreamData(-1, 0, 0, Ref{Ptr{PaStream}}(0))
 
-	data = RealTimeAudioDEData(prob, alg, control, state, stream,
-                           zeros(Float32, length(prob.u0), 1), nothing, nothing, nothing, Atomic{Bool}(false))
+	data = RealTimeAudioDEData(prob, alg, control, state, stream)
 
 	return DESource(data, callback_ptr)
-end
-
-function _produce_audio!(data::RealTimeAudioDEData)
-    Base.flush_denormals(true)
-    G = data.G
-    nch = size(G, 2)
-    nvars = size(G, 1)
-    rb = data.rb::RBAudio
-    gain32 = Float32(data.control.gain)
-
-    integ = data.integrator
-    @assert integ !== nothing
-
-    while data.running[]
-        # Ensure there is space for nch samples (one frame)
-        if rb_available_to_write(rb) < nch
-            # simple backoff; PortAudio will read and free space
-            ccall(:jl_cpu_pause, Cvoid, ())  # tiny CPU pause, optional
-            continue
-        end
-
-        # One integrator step -> one audio FRAME worth of state
-        step!(integ)  # requires f!(du,u,p,t) in-place and type-stable for good perf
-
-        y = integ.u  # current state vector
-        # Mix: sample for each output channel
-        @inbounds @simd for ch in 1:nch
-            s = 0.0f0
-            @inbounds @simd for k in 1:nvars
-                s += G[k, ch] * Float32(y[k])
-            end
-            rb_push!(rb, gain32 * s)
-        end
-    end
-    return
 end
 
 function create_callback()
@@ -258,32 +143,57 @@ function create_callback()
 
 		data = unsafe_load(convert(Ptr{RealTimeAudioDEData}, userData))
 
+		ts = data.control.ts
+		channel_map = data.control.channel_map
+		n_channels = data.stream_data.n_channels
+		sample_rate = data.stream_data.sample_rate
+		dt = 1. / sample_rate * ts
+		t_min = data.state.t
+		t_max = t_min + dt * framesPerBuffer
+		t_span = (t_min, t_max)
+		u0 = data.state.u
+		p = data.control.p
+		prob = data.problem
+		alg = data.alg
+		r_prob = remake(prob; u0 = u0, tspan = t_span, p = p, saveat = dt)
+
+		sol = solve(r_prob, alg)
+
+		gain = data.control.gain
 		out_sample::Ptr{Cfloat} = convert(Ptr{Cfloat}, outputBuffer)
-        frames = Int(framesPerBuffer)
-        nch = Int(data.stream_data.n_channels)
-        nsamp = frames * nch
 
-        rb = data.rb
-        if rb === nothing
-            # Safety: fill silence if not ready
-            @inbounds for i in 1:nsamp
-                unsafe_store!(out_sample, 0.0f0, i)
-            end
-            return paContinue
-        end
+		# If the solver finished correctly, we update the output buffer. Otherwise, we
+		# fill it with zeros.
+		# Here we should also try to interpolate the solution. So far it didn't work.
+		if SciMLBase.successful_retcode(sol)
+			
+			out_idx = 1
+			for i in 1:framesPerBuffer
+				# Channel Map:
+				for channel in 1:n_channels
+					sample = 0.;
+					for (variable, g) in enumerate(channel_map[:, channel])
+						sample += sol.u[i][variable] * g
+					end
+					sample *= gain
+					unsafe_store!(out_sample, convert(Cfloat, sample), out_idx)
+					out_idx += 1
+				end
+			end
+			# We update the state (only if the integration was successful, which
+			# allows us to recover in case of error)
+			data.state.t = t_max
+			@inbounds @. data.state.u = sol.u[end]
+		else
+			for i in 1:framesPerBuffer
+				unsafe_store!(out_sample, convert(Cfloat, 0.), i)
+			end
+		end
 
-        # Pop as many samples as available; zero the rest
-        popped = rb_pop!(rb, out_sample, nsamp)
-        if popped < nsamp
-            # zero-fill tail
-            @inbounds for i in popped+1:nsamp
-                unsafe_store!(out_sample, 0.0f0, i)
-            end
-        end
+		return paContinue
+	end
 
-        return paContinue
-    end
-    return callback
+	return callback
 end
 
 #! export
@@ -318,21 +228,12 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
 	end
 	output_device_info = unsafe_load(Pa_GetDeviceInfo(output_device))
 
-	 # Determine n_channels from channel_map and clamp to device capability
-    n_channels = if source.data.control.channel_map isa AbstractMatrix
-        size(source.data.control.channel_map, 2)
-    else
-        length(source.data.control.channel_map)
-    end
+	n_channels = size(source.data.control.channel_map, 2) # number of columns
 	if output_device_info.maxOutputChannels < n_channels
 		@warn "output device has less channels than channel map"
 		n_channels = output_device_info.maxOutputChannels
 	end
 	source.data.stream_data.n_channels = n_channels
-
-	# Normalize channel map to a gain matrix G (nvars × nch)
-    nvars = length(source.data.problem.u0)
-    source.data.G = normalize_channel_map(source.data.control.channel_map, nvars, n_channels)
 
 	stream_parameters = PaStreamParameters(
 		output_device,
@@ -345,30 +246,8 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
 	sample_rate = sample_rate < 0. ? output_device_info.defaultSampleRate : sample_rate
 	source.data.stream_data.sample_rate = sample_rate
 	source.data.stream_data.buffer_size = buffer_size #! Unnecessary?
-	
-	# --- Build integrator ONCE with fixed dt ---
-    dt = Float32( (1.0 / sample_rate) * source.data.control.ts )
-    # Make an "infinite" tspan from current state.t
-    t0 = source.data.state.t
-    prob = source.data.problem
-    r_prob = remake(prob; u0 = source.data.state.u, tspan = (t0, Inf), p = source.data.control.p)
-    integ = init(r_prob, source.data.alg; dt=dt, adaptive=false,
-                 save_everystep=false, save_start=false, save_end=false)
-    source.data.integrator = integ
-
-    # --- Ring buffer sized for at least ~ 4 buffers of audio ---
-    frames = buffer_size == paFramesPerBufferUnspecified ? 256 : Int(buffer_size)
-    rb_len = 8 * frames * n_channels  # some headroom
-    source.data.rb = RBAudio(rb_len)
-
-    # --- Start producer task ---
-    source.data.running[] = true
-    source.data.producer = @async try
-        _produce_audio!(source.data)
-    catch e
-        source.data.running[] = false
-        @error "Producer task crashed" exception=(e, catch_backtrace())
-    end
+	callback = source.callback
+	data = source.data
 
 	err = Pa_OpenStream(
 		r_stream,
@@ -378,19 +257,19 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
 		buffer_size,
 		0,
 		callback,
-		Ref(source.data))
+		Ref(data))
 	
-	 if err != 0
-        source.data.running[] = false
-        error(unsafe_string(Pa_GetErrorText(err)))
-    end
+	if err != 0
+		error(unsafe_string(Pa_GetErrorText(err)))
+	end
+	
 
-    err = Pa_StartStream(r_stream[])
-    if err != 0
-        source.data.running[] = false
-        error(unsafe_string(Pa_GetErrorText(err)))
-    end
-    println("Start stream")
+	err = Pa_StartStream(r_stream[])
+
+	if err != 0
+		error(unsafe_string(Pa_GetErrorText(err)))
+	end
+	println("Start stream")
 end
 
 #! export
@@ -404,26 +283,14 @@ function stop_DESource(source::DESource)
 	stream_status = Pa_IsStreamStopped(r_stream[])
 	if stream_status == 1
 		println("Stream already stopped")
-	else
-        err = Pa_StopStream(r_stream[])
-        if err != 0
-            error(unsafe_string(Pa_GetErrorText(err)))
-        end
-        println("Stop stream")
-    end
-	# Stop producer
-    if source.data.running[]
-        source.data.running[] = false
-    end
-    if source.data.producer !== nothing
-        try
-            wait(source.data.producer)
-        catch
-            # ignore
-        end
-        source.data.producer = nothing
-    end
-    source.data.rb = nothing
+		return
+	end
+
+	err = Pa_StopStream(r_stream[])
+	if err != 0
+		error(unsafe_string(Pa_GetErrorText(err)))
+	end
+	println("Stop stream")
 end
 
 #! export
