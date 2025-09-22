@@ -25,7 +25,9 @@ function nreeds(ntot,kmean,vmean,dmu)
     #parray =  [collect(1:4:2*ntot), collect(3:4:2*ntot)]
     #parray = [1,3]
     source = DESource(nreed!, u0, p; channel_map = mix)
+    println(source)
     sleep(1)
+    println("Starting audio...")
     output_device = get_default_output_device()
 	start_DESource(source, output_device; buffer_size=convert(UInt32,1024))
     set_ts!(source,1500.0)

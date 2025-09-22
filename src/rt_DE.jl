@@ -40,11 +40,17 @@ mutable struct RealTimeAudioDEData
 	state::RealTimeAudioDEStateData
 	stream_data::RealTimeAudioDEStreamData
 	 # --- NEW ---
-    G::Matrix{Float32}                       # normalized gain matrix (nvars × n_channels)
+    G::Matrix{Float64}                       # normalized gain matrix (nvars × n_channels)
     rb::Union{RBAudio, Nothing}              # ring buffer for inter-thread audio samples
     producer::Union{Task, Nothing}           # background integrator task
     integrator::Any                          # ODE/SDE integrator (init(...) result)
     running::Atomic{Bool}                    # run flag for producer
+	# diagnostics (atomic counters)
+    frames_cb::Atomic{Int}           # number of PortAudio callback frames processed
+    samples_popped::Atomic{Int}      # total samples popped out to PortAudio
+    underflows::Atomic{Int}          # times we had to zero-fill
+    framesize_mismatch::Atomic{Int}  # times framesPerBuffer ≠ configured frames
+    pushed_samples::Atomic{Int}      # total samples the producer pushed
 end
 
 #! export
@@ -64,21 +70,41 @@ end
 @inline rb_is_empty(rb::RBAudio) = rb.w[] == rb.r[]
 @inline rb_is_full(rb::RBAudio)  = rb_available_to_write(rb)
 
+#! export
+function audio_debug_status(src::DESource)
+    d = src.data
+    (
+        frames_cb          = d.frames_cb[],
+        samples_popped     = d.samples_popped[],
+        pushed_samples     = d.pushed_samples[],
+        underflows         = d.underflows[],
+        framesize_mismatch = d.framesize_mismatch[],
+        rb_level           = d.rb === nothing ? -1 : (d.rb.w[] - d.rb.r[]),
+        rb_capacity        = d.rb === nothing ? -1 : rb_capacity(d.rb)
+    )
+end
+
 # pop up to n samples; returns number popped
 function rb_pop!(rb::RBAudio, out::Ptr{Cfloat}, n::Int)
-    avail = rb_available_to_read(rb)
+    avail = rb.w[] - rb.r[]
     m = min(avail, n)
     if m <= 0
         return 0
     end
-    ri = rb.r[] & rb.mask
-    tail = min(m, rb_capacity(rb) - ri)
-    # first chunk
-    @inbounds unsafe_copyto!(out, 1, pointer(rb.buf, ri+1), tail)
-    # wrap chunk
+    ri   = rb.r[] & rb.mask
+    cap  = length(rb.buf)
+    tail = min(m, cap - ri)
+
+    # first contiguous chunk
+    src1 = pointer(rb.buf, ri + 1)                 # ::Ptr{Float32}
+    Base.unsafe_copyto!(out, src1, tail)           # 3-arg form: (dest::Ptr, src::Ptr, nelems)
+
     if tail < m
-        @inbounds unsafe_copyto!(out, tail+1, pointer(rb.buf, 1), m - tail)
+        # wrapped chunk
+        src2 = pointer(rb.buf, 1)
+        Base.unsafe_copyto!(out + tail, src2, m - tail)
     end
+
     rb.r[] = rb.r[] + m
     return m
 end
@@ -91,13 +117,12 @@ end
     nothing
 end
 
-# ========== Channel map normalization to a gain matrix ==========
-function normalize_channel_map(channel_map, nvars::Int, nch::Int)::Matrix{Float32}
-    G = zeros(Float32, nvars, nch)
+function normalize_channel_map(channel_map, nvars::Int, nch::Int)::Matrix{Float64}
+    G = zeros(Float64, nvars, nch)
     if channel_map isa Vector{Int}
         for (ch, var) in enumerate(channel_map[1:min(end, nch)])
             if 1 <= var <= nvars
-                G[var, ch] = 1f0
+                G[var, ch] = 1.0
             end
         end
     elseif channel_map isa Vector{Vector{Int}}
@@ -105,18 +130,50 @@ function normalize_channel_map(channel_map, nvars::Int, nch::Int)::Matrix{Float3
             ch > length(channel_map) && break
             for var in channel_map[ch]
                 if 1 <= var <= nvars
-                    G[var, ch] += 1f0
+                    G[var, ch] += 1.0
                 end
             end
         end
     elseif channel_map isa AbstractMatrix
         @inbounds for ch in 1:nch, k in 1:min(nvars, size(channel_map,1))
-            G[k, ch] = Float32(channel_map[k, ch])
+            G[k, ch] = Float64(channel_map[k, ch])
         end
     else
         error("Unsupported channel_map type")
     end
     return G
+end
+
+function rebuild_integrator_f64!(src::DESource)
+    d   = src.data
+    fs  = d.stream_data.sample_rate               # Float64
+    dt  = (1.0 / fs) * d.control.ts               # Float64
+    t0  = Float64(d.state.t)
+    u0  = Float64.(d.state.u)
+    p   = Float64.(d.control.p)
+
+    rprob = remake(d.problem; u0=u0, tspan=(t0, Inf), p=p)
+
+    d.integrator = init(rprob, d.alg; dt=dt, adaptive=false,
+                 save_everystep=false, save_start=false, save_end=false)
+end
+
+
+# Peek at the next mixed sample without changing the audio path
+function current_mix_snapshot(src::DESource)
+    integ = src.data.integrator
+    G = src.data.G
+    nch = size(G,2); nvars = size(G,1)
+    y = integ.u
+    s = zeros(Float64, nch)
+    @inbounds @simd for ch in 1:nch
+        acc = 0.0
+        @inbounds @simd for k in 1:nvars
+            acc += G[k,ch]*y[k]
+        end
+        s[ch] = src.data.control.gain * acc
+    end
+    (; t = integ.t, sample = s)
 end
 
 #! export
@@ -207,43 +264,38 @@ function _DESource(prob::DEProblem, alg, channel_map)::DESource
 
 	stream = RealTimeAudioDEStreamData(-1, 0, 0, Ref{Ptr{PaStream}}(0))
 
-	data = RealTimeAudioDEData(prob, alg, control, state, stream,
-                           zeros(Float32, length(prob.u0), 1), nothing, nothing, nothing, Atomic{Bool}(false))
-
+	#data = RealTimeAudioDEData(prob, alg, control, state, stream, zeros(Float32, length(prob.u0), 1), 
+	#nothing, nothing, nothing, Atomic{Bool}(false))
+	data = RealTimeAudioDEData(prob, alg, control, state, stream, zeros(Float32, length(prob.u0), 1), 
+		nothing, nothing, nothing, Atomic{Bool}(false), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0))
 	return DESource(data, callback_ptr)
 end
 
 function _produce_audio!(data::RealTimeAudioDEData)
-    Base.flush_denormals(true)
-    G = data.G
-    nch = size(G, 2)
-    nvars = size(G, 1)
+    nch = size(data.G, 2)
+    nvars = size(data.G, 1)
     rb = data.rb::RBAudio
-    gain32 = Float32(data.control.gain)
-
+    
     integ = data.integrator
     @assert integ !== nothing
 
-    while data.running[]
+	while data.running[]
         # Ensure there is space for nch samples (one frame)
-        if rb_available_to_write(rb) < nch
-            # simple backoff; PortAudio will read and free space
-            ccall(:jl_cpu_pause, Cvoid, ())  # tiny CPU pause, optional
-            continue
+        target = Int(floor(0.9 * rb_capacity(rb)))
+        while rb_available_to_write(rb) >= nch && (rb.w[] - rb.r[]) < target
+            step!(integ)  # requires f!(du,u,p,t) in-place and type-stable for good perf
+			y = integ.u  # current state vector
+			# Mix: sample for each output channel
+			@inbounds @simd for ch in 1:nch
+				s = 0.0
+				@inbounds @simd for k in 1:nvars
+					s += data.G[k, ch] * y[k]
+				end
+				rb_push!(rb, Float32(data.control.gain*s))
+			end
+			data.pushed_samples[] = data.pushed_samples[] + nch
         end
-
-        # One integrator step -> one audio FRAME worth of state
-        step!(integ)  # requires f!(du,u,p,t) in-place and type-stable for good perf
-
-        y = integ.u  # current state vector
-        # Mix: sample for each output channel
-        @inbounds @simd for ch in 1:nch
-            s = 0.0f0
-            @inbounds @simd for k in 1:nvars
-                s += G[k, ch] * Float32(y[k])
-            end
-            rb_push!(rb, gain32 * s)
-        end
+        Base.yield()
     end
     return
 end
@@ -256,12 +308,19 @@ function create_callback()
 			statusFlags::PaStreamCallbackFlags, 
 			userData::Ptr{Cvoid})::PaStreamCallbackResult
 
-		data = unsafe_load(convert(Ptr{RealTimeAudioDEData}, userData))
+		data = unsafe_pointer_to_objref(userData)::RealTimeAudioDEData
 
-		out_sample::Ptr{Cfloat} = convert(Ptr{Cfloat}, outputBuffer)
+		out_sample = convert(Ptr{Cfloat}, outputBuffer)
         frames = Int(framesPerBuffer)
         nch = Int(data.stream_data.n_channels)
         nsamp = frames * nch
+
+		# count frames & detect mismatch
+		data.frames_cb[] = data.frames_cb[] + 1
+		expected = Int(data.stream_data.buffer_size)   # what we asked PA to use
+		if expected != 0 && frames != expected
+			data.framesize_mismatch[] = data.framesize_mismatch[] + 1
+		end
 
         rb = data.rb
         if rb === nothing
@@ -274,7 +333,9 @@ function create_callback()
 
         # Pop as many samples as available; zero the rest
         popped = rb_pop!(rb, out_sample, nsamp)
+		data.samples_popped[] = data.samples_popped[] + popped
         if popped < nsamp
+			data.underflows[] = data.underflows[] + 1
             # zero-fill tail
             @inbounds for i in popped+1:nsamp
                 unsafe_store!(out_sample, 0.0f0, i)
@@ -347,7 +408,7 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
 	source.data.stream_data.buffer_size = buffer_size #! Unnecessary?
 	
 	# --- Build integrator ONCE with fixed dt ---
-    dt = Float32( (1.0 / sample_rate) * source.data.control.ts )
+    dt = Float64( (1.0 / sample_rate) * source.data.control.ts )
     # Make an "infinite" tspan from current state.t
     t0 = source.data.state.t
     prob = source.data.problem
@@ -358,6 +419,8 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
 
     # --- Ring buffer sized for at least ~ 4 buffers of audio ---
     frames = buffer_size == paFramesPerBufferUnspecified ? 256 : Int(buffer_size)
+	buffer_size = UInt32(frames)
+	source.data.stream_data.buffer_size = buffer_size
     rb_len = 8 * frames * n_channels  # some headroom
     source.data.rb = RBAudio(rb_len)
 
@@ -369,7 +432,7 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
         source.data.running[] = false
         @error "Producer task crashed" exception=(e, catch_backtrace())
     end
-
+	# --- Start PortAudio stream ---
 	err = Pa_OpenStream(
 		r_stream,
 		C_NULL,			# input parameters
@@ -377,8 +440,9 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
 		sample_rate,
 		buffer_size,
 		0,
-		callback,
-		Ref(source.data))
+		source.callback,
+		pointer_from_objref(source.data)
+	)
 	
 	 if err != 0
         source.data.running[] = false
@@ -676,3 +740,28 @@ function Base.show(io::IO, source::DESource)
 	print(io, "gain: ", source.data.control.gain, '\n')
 	print(io, "channel_map: ", source.data.control.channel_map, '\n')
 end
+
+
+function probe_integrator!(src::DESource; n=1024, take=16)
+    integ = src.data.integrator
+    integ === nothing && error("Integrator not initialized.")
+    vals = Vector{Float32}(undef, min(n,take))
+    changed = false
+    last = Float32(integ.u[1])
+    for i in 1:n
+        step!(integ)
+        y1 = Float32(integ.u[1])
+        if i ≤ length(vals); vals[i] = y1; end
+        changed |= (y1 != last)
+        last = y1
+    end
+    (; changed, first_vals = vals)
+end
+
+# Show dt, t, types (sanity)
+integrator_info(src::DESource) = (
+    t = src.data.integrator.t,
+    dt = getfield(src.data.integrator, :dt),  # works for OrdinaryDiffEq integrators
+    eltype_u = eltype(src.data.integrator.u),
+    eltype_p = eltype(src.data.integrator.p)
+)
