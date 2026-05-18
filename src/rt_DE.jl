@@ -162,7 +162,9 @@ end
 # Peek at the next mixed sample without changing the audio path
 function current_mix_snapshot(src::DESource)
     integ = src.data.integrator
+    integ === nothing && error("Integrator is not initialized. Call start_DESource(source, device) before current_mix_snapshot.")
     G = src.data.G
+    size(G, 2) == 0 && error("Channel map is not initialized. Call start_DESource(source, device) before current_mix_snapshot.")
     nch = size(G,2); nvars = size(G,1)
     y = integ.u
     s = zeros(Float64, nch)
@@ -196,7 +198,7 @@ and each row is a variable. The values in the matrix are the gains for each vari
 function DESource(f, u0::Vector{Float64}, p::Vector{Float64};
 		alg = Tsit5(), channel_map::Matrix{Float64})::DESource
 
-	prob = ODEProblem(f, u0, (0.0, 0.01), p;  
+	prob = ODEProblem(f, u0, (0.0, Inf), p;  
 		save_start = true,
 		save_end = true, 
 		verbose = false)
@@ -207,7 +209,7 @@ end
 function DESource(f::ODEFunction, u0::Vector{Float64}, p::Vector{Float64};
 	alg = Tsit5(), channel_map::Matrix{Float64})::DESource
 
-prob = ODEProblem(f, u0, (0.0, 0.01), p;  
+prob = ODEProblem(f, u0, (0.0, Inf), p;  
 	save_start = true,
 	save_end = true, 
 	verbose = false)
@@ -226,7 +228,7 @@ Create a Stochastic DESource from a drift function and a noise function.
 function DESource(f, g, u0::Vector{Float64}, p::Vector{Float64};
 		alg = SOSRA(), channel_map::Matrix{Float64})::DESource
 
-	prob = SDEProblem(f, g, u0, (0.0, 0.01), p; 
+	prob = SDEProblem(f, g, u0, (0.0, Inf), p; 
 		save_start = true,
 		save_end = true, 
 		verbose = false)
@@ -237,7 +239,7 @@ end
 function DESource(f::SDEFunction, u0::Vector{Float64}, p::Vector{Float64};
 	alg = SOSRA(), channel_map::Matrix{Float64})::DESource
 
-prob = SDEProblem(f, u0, (0.0, 0.01), p; 
+prob = SDEProblem(f, u0, (0.0, Inf), p; 
 	save_start = true,
 	save_end = true, 
 	verbose = false)
@@ -572,6 +574,10 @@ function getparam(source::DESource, index::Int)
 		error("index out of bounds.")
 	end
 	return source.data.control.p[index]
+end
+
+function get_param(source::DESource, index::Int)
+    return getparam(source, index)
 end
 
 #! export
