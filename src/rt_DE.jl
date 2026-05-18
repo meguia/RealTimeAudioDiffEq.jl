@@ -1,7 +1,9 @@
 include("libportaudio.jl")
 
 using .LibPortAudio
-using DifferentialEquations
+using SciMLBase
+using OrdinaryDiffEq
+using StochasticDiffEq
 using Atomix: @atomic, @atomicswap
 using Base.Threads
 
