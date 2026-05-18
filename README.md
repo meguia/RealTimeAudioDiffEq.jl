@@ -4,6 +4,8 @@
 
 A simple Julia package for real-time audification of ODEs and SDEs
 
+Note: with the DifferentialEquations.jl v8 ecosystem split, non-ODE solvers are no longer implicitly available from the umbrella package. This package depends explicitly on OrdinaryDiffEq and StochasticDiffEq to support both ODE and SDE sources.
+
 ### Install:
 ```julia
 import Pkg

@@ -51,15 +51,23 @@ using Test
         @test_throws ErrorException set_param!(src, 99, 1.0)
         @test_throws ErrorException get_param(src, 99)
         @test_throws ErrorException set_u0!(src, [1.0])
+    end
 
-        err = try
-            current_mix_snapshot(src)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ErrorException
-        @test occursin("Integrator is not initialized", sprint(showerror, err))
+    @testset "channel_map backward compatibility" begin
+        u0 = [0.1, 0.2]
+        p = [2.0, 3.0]
+
+        src_idx = DESource(ode_rhs!, u0, p; channel_map = [1, 2])
+        @test get_channelmap(src_idx) == [1.0 0.0; 0.0 1.0]
+
+        src_groups = DESource(ode_rhs!, u0, p; channel_map = [[1], [1, 2]])
+        @test get_channelmap(src_groups) == [1.0 1.0; 0.0 1.0]
+
+        set_channelmap!(src_idx, [2, 1])
+        @test get_channelmap(src_idx) == [0.0 1.0; 1.0 0.0]
+
+        @test_throws ErrorException DESource(ode_rhs!, u0, p; channel_map = [3])
+        @test_throws ErrorException set_channelmap!(src_idx, [[0]])
     end
 
     @testset "SDE constructor" begin

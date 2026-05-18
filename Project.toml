@@ -13,9 +13,9 @@ libportaudio_jll = "2d7b7beb-0762-5160-978e-1ab83a1e8a31"
 [compat]
 julia = "1.10"
 Atomix = "^1.1.0"
-OrdinaryDiffEq = "^6.0.0"
-SciMLBase = "^2.0.0"
-StochasticDiffEq = "^6.0.0"
+OrdinaryDiffEq = "6, 7"
+SciMLBase = "2, 3"
+StochasticDiffEq = "6, 7"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
