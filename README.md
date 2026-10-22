@@ -4,16 +4,12 @@ Audio from ordinary and stochastic differential equations (ODEs and SDEs),
 with experimental support for ordinary and neutral delay equations (DDEs).
 
 This branch, `feature/sciml-delay-audio`, builds on
-`feature/integrator-interface-audio`. The first branch is the ODE/SDE change
-proposed for upstream; this second branch adds a single DDE path using
+`feature/integrator-interface-audio` and adds a single DDE path using
 DelayDiffEq. Both keep runtime code in `src/rt_DE.jl`.
 
 **Status:** the ODE/SDE renderer retains its tested zero-allocation paths.
 The DDE renderer uses SciML's actual interpolation and adaptive solver, but
-allocates while recording history. It is an experimental audio backend,
-not a replacement with the same real-time performance as the older custom
-history experiments. Existing live tube notebooks should keep their current
-backend until controls and audio timing are qualified with this branch.
+allocates while recording history. 
 
 ## Install and run
 
@@ -86,7 +82,7 @@ failure silences the block and latches silence until reset or preparation.
 An ordinary DDE reads a past state, `h(p, t-delay)`. A neutral DDE also reads
 its past derivative, `h(p, t-delay, Val{1})`. Use `neutral=true` only when the
 model actually needs delayed derivatives. Both use the same constructor and
-rendering code; there is no second implementation of ordinary DDEs.
+rendering code.
 
 ```julia
 using SciMLBase: DDEProblem
@@ -120,7 +116,7 @@ after importing `Rodas5P` from OrdinaryDiffEqRosenbrock. The tests exercise this
 method on a stiff delayed equation as well as `Tsit5` on a non-stiff one.
 
 The audio grid remains regular. Adaptive internal steps end at each grid
-point and are limited to `timescale / sample_rate / substeps`; this interval
+point and are limited to `timescale / sample_rate / substeps`. This interval
 must not exceed the smallest declared lag. `abstol` and `reltol` control local
 solver error, not a global accuracy guarantee or a deadline. A low-order
 method with very tight tolerances can require too many steps for audio.
@@ -151,7 +147,7 @@ are outside this implementation. Supply derivative prehistory for a neutral
 equation, including any incompatibility at the initial time.
 
 Stopping and preparing again retains the complete DDE solver and its history.
-Changing parameters requires `reset_state!`; changing timescale or step size
+Changing parameters requires `reset_state!`. Changing timescale or step size
 requires stopping, resetting, and preparing again. A reset starts a new
 trajectory using the supplied prehistory. Changes to delay values require a
 new problem with matching `constant_lags`. Gain and channel maps can change
@@ -188,37 +184,3 @@ tested ODE/SDE rendering and callback paths allocate zero Julia heap bytes.
 Setup, control publication, resets, other algorithms, and allocating user
 equations are outside that claim. Julia GC and operating-system scheduling
 still prevent a hard real-time guarantee.
-
-DDE tests compare rolling history with an untrimmed DelayDiffEq integrator,
-including delayed values and derivatives, a stiff solver, nonzero initial
-time, resets, and stopping/restarting. An independent analytic neutral echo
-checks recurring derivative discontinuities over many blocks. Storage-limit
-failure is tested explicitly. These offline checks do not certify physical
-audio playback or glitch-free operation.
-
-### Local validation
-
-On Julia 1.13.1, Linux x86-64, with two Julia threads and one BLAS thread,
-all 3,129 package checks passed (including the 204 ODE/SDE checks). A separate
-check of the four existing tube models passed 20 checks, comparing trajectories
-over 12 model-time units against a tighter independent DelayDiffEq solve.
-Maximum state error was 2.54e-7; maximum derived-pressure error was 1.16e-7,
-excluding the two-valued pressure jump endpoints.
-
-The same worker was timed with GC enabled at 48 kHz, 256-frame blocks and
-four substeps, after warmup. Each row contains 400 timed blocks; allocation
-was measured separately over 100 blocks. These are local measurements, not
-portable performance guarantees.
-
-| Tube model | Median block | Maximum block | Allocated per block | Blocks over 5.33 ms |
-| --- | ---: | ---: | ---: | ---: |
-| Rayleigh, linear coupling | 0.70 ms | 65.39 ms | 0.773 MB | 5/400 |
-| Rayleigh, nonlinear coupling | 0.90 ms | 71.51 ms | 1.079 MB | 4/400 |
-| Valve, squared conductance | 0.71 ms | 70.27 ms | 0.771 MB | 2/400 |
-| Valve, Bernoulli flow | 0.77 ms | 84.75 ms | 0.771 MB | 2/400 |
-
-A small median is insufficient for reliable real-time playback: the long
-blocks can empty the audio queue. No audio device was used in these tests.
-This is why the DDE addition remains experimental despite passing its
-numerical checks. The research scripts and logs are preserved in the local
-native backup; this branch contains the implementation, tests, and README.
