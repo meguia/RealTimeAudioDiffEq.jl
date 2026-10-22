@@ -1,10 +1,12 @@
 include("libportaudio.jl")
 using .LibPortAudio
 import SciMLBase
-using SciMLBase: AbstractDEAlgorithm, AbstractSciMLProblem, ODEFunction, ODEProblem,
+using SciMLBase: AbstractDEAlgorithm, AbstractSciMLProblem, DDEProblem, ODEFunction, ODEProblem,
     SDEFunction, SDEProblem, remake, init, step!, reinit!, set_proposed_dt!,
-    successful_retcode, check_error
+    successful_retcode, check_error, add_tstop!
 using OrdinaryDiffEqTsit5: Tsit5
+using DelayDiffEq: MethodOfSteps
+import OrdinaryDiffEqCore
 using StochasticDiffEq: SOSRA
 using Base.Threads: Atomic
 
@@ -17,8 +19,9 @@ mutable struct RBAudio
 end
 
 # The type parameter lets Julia specialize the complete sample loop.
-mutable struct AudioRenderer{I}
+mutable struct AudioRenderer{I,H}
     integrator::I
+    history::H
     parameters::Vector{Float64}
     sample_rate::Float64
     timescale::Float64
@@ -50,6 +53,16 @@ mutable struct RealTimeAudioDEStreamData
     ever_started::Bool
 end
 
+mutable struct DelayWindow
+    max_delay::Float64
+    start::Float64
+    dt::Float64
+    steps::Int
+    abstol::Float64
+    reltol::Float64
+    capacity::Int
+end
+
 mutable struct RealTimeAudioDEData
     problem::AbstractSciMLProblem
     alg::AbstractDEAlgorithm
@@ -68,6 +81,7 @@ mutable struct RealTimeAudioDEData
     framesize_mismatch::Atomic{Int}
     pushed_samples::Atomic{Int}
     solver_failures::Atomic{Int}
+    delay_window::Union{Nothing,DelayWindow}
 end
 
 mutable struct DESource
@@ -129,23 +143,141 @@ function DESource(f::SDEFunction, u0::Vector{Float64}, p::Vector{Float64};
     _DESource(SDEProblem(f, copy(u0), (0.0, 0.01), copy(p)), alg, channel_map)
 end
 
-function _DESource(prob::AbstractSciMLProblem, alg::AbstractDEAlgorithm, channel_map)
+function _DESource(prob::AbstractSciMLProblem, alg::AbstractDEAlgorithm, channel_map; delay_window=nothing)
     isempty(prob.u0) && throw(ArgumentError("state must not be empty"))
     all(isfinite, prob.u0) || throw(ArgumentError("initial state must be finite"))
     all(isfinite, prob.p) || throw(ArgumentError("parameters must be finite"))
     G = normalize_channel_map(channel_map, length(prob.u0))
     c = RealTimeAudioDEControlData(copy(prob.u0), copy(prob.p), 1.0, 1.0, G,
         nothing, ReentrantLock())
-    state = RealTimeAudioDEStateData(0.0, copy(prob.u0))
+    state = RealTimeAudioDEStateData(Float64(first(prob.tspan)), copy(prob.u0))
     stream = RealTimeAudioDEStreamData(-1.0, 0, 0, Ref{Ptr{PaStream}}(C_NULL), false)
     d = RealTimeAudioDEData(prob, alg, c, state, stream, nothing, nothing, nothing,
         nothing, Float32[], Atomic{Bool}(false), Atomic{Int}(0), Atomic{Int}(0),
-        Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0))
+        Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), Atomic{Int}(0), delay_window)
     callback = create_callback()
     callback_ptr = @cfunction($callback, PaStreamCallbackResult,
         (Ptr{Cvoid}, Ptr{Cvoid}, Culong, Ptr{PaStreamCallbackTimeInfo},
          PaStreamCallbackFlags, Ptr{Cvoid}))
     DESource(d, callback_ptr)
+end
+
+
+"""
+    DESource(problem::DDEProblem; alg=MethodOfSteps(Tsit5()), max_delay,
+             channel_map=[1, 1], abstol=1e-12, reltol=1e-10,
+             history_capacity=100_000)
+
+Use DelayDiffEq's solver and interpolation with a rolling history window.
+Supports in-place Float64 equations with positive constant lags; neutral
+equations currently require one lag. Adaptive DDE rendering allocates in SciML;
+history_capacity limits retained interpolation knots; exhaustion silences output.
+"""
+function DESource(prob::DDEProblem; alg=MethodOfSteps(Tsit5()),
+        max_delay::Real=maximum(prob.constant_lags; init=0.0), channel_map=[1, 1],
+        abstol::Real=1e-12, reltol::Real=1e-10, history_capacity::Integer=100_000)
+    SciMLBase.isinplace(prob) || throw(ArgumentError("DDE dynamics must be in-place"))
+    prob.u0 isa Vector{Float64} && prob.p isa Vector{Float64} ||
+        throw(ArgumentError("DDE state and parameters must be Float64 vectors"))
+    isempty(prob.dependent_lags) || throw(ArgumentError("declare constant delays"))
+    isempty(prob.kwargs) || throw(ArgumentError("DDE callbacks and solver keywords are not supported"))
+    isone(prob.f.mass_matrix) || throw(ArgumentError("DDE mass matrix must be the identity"))
+    alg isa MethodOfSteps || throw(ArgumentError("pass a DelayDiffEq MethodOfSteps algorithm"))
+    lags = Tuple(Float64.(prob.constant_lags))
+    !isempty(lags) && all(x -> isfinite(x) && x > 0, lags) ||
+        throw(ArgumentError("declare finite, positive constant_lags"))
+    prob.neutral && length(lags) != 1 &&
+        throw(ArgumentError("neutral audio currently supports one constant lag"))
+    isfinite(max_delay) && max_delay >= maximum(lags) ||
+        throw(ArgumentError("max_delay must cover all declared lags"))
+    isfinite(first(prob.tspan)) || throw(ArgumentError("initial time must be finite"))
+    all(x -> isfinite(x) && x > 0, (abstol, reltol)) ||
+        throw(ArgumentError("DDE tolerances must be finite and positive"))
+    history_capacity >= 4 || throw(ArgumentError("history_capacity must be at least four"))
+    owned = remake(prob; u0=copy(prob.u0), p=copy(prob.p), constant_lags=lags)
+    window = DelayWindow(Float64(max_delay), Float64(first(prob.tspan)), NaN, 0,
+        Float64(abstol), Float64(reltol), Int(history_capacity))
+    _DESource(owned, alg, channel_map; delay_window=window)
+end
+
+_history(::Nothing, integ) = nothing
+_history(::DelayWindow, integ) = integ.history
+_trim_history!(::Nothing, integ) = nothing
+
+# DelayDiffEq 6.3.1 storage bookkeeping; interpolation remains entirely in SciML.
+function _trim_history!(h::DelayWindow, integ)
+    saved = integ.integrator
+    sol = saved.sol
+    remove = min(searchsortedfirst(sol.t, integ.t - h.max_delay) - 3,
+        integ.prev_idx - 1, integ.prev2_idx - 1)
+    if remove > 0
+        deleteat!(sol.t, 1:remove)
+        deleteat!(sol.u, 1:remove)
+        deleteat!(sol.k, 1:remove)
+        sol.alg_choice === nothing || deleteat!(sol.alg_choice, 1:remove)
+        saved.saveiter -= remove
+        saved.saveiter_dense -= remove
+        integ.prev_idx -= remove
+        integ.prev2_idx -= remove
+        sol.interp.ts_hint.idx_prev = max(0, sol.interp.ts_hint.idx_prev - remove)
+        OrdinaryDiffEqCore.reprobe_ts_hint!(sol.interp.ts_hint)
+    end
+    # Only dependent delays use this log; future constant-lag events stay queued.
+    empty!(integ.tracked_discontinuities)
+    nothing
+end
+
+function _advance!(::Nothing, integ)
+    previous = integ.t
+    step!(integ)
+    integ.t > previous && all(isfinite, integ.u) && successful_retcode(check_error(integ))
+end
+
+function _advance!(h::DelayWindow, integ)
+    target = h.start + (h.steps + 1) * h.dt
+    target > integ.t || return false
+    add_tstop!(integ, target)
+    tolerance = 16eps(max(abs(target), 1.0))
+    while integ.t < target
+        if length(integ.integrator.sol.t) >= h.capacity
+            _trim_history!(h, integ)
+            length(integ.integrator.sol.t) >= h.capacity && return false
+        end
+        previous = integ.t
+        step!(integ)
+        integ.t > previous && all(isfinite, integ.u) &&
+            successful_retcode(check_error(integ)) || return false
+    end
+    h.steps += 1
+    abs(integ.t - target) <= tolerance
+end
+
+function _prepare_integrator(d, prob, p, dt, reset)
+    prepared = remake(prob; u0=copy(d.state.u), p=copy(p), tspan=(d.state.t, Inf))
+    integ = init(prepared, d.alg; dt, adaptive=false, save_on=false,
+        save_start=false, save_end=false, save_everystep=false, dense=false,
+        save_noise=false, maxiters=typemax(Int))
+    integ, nothing
+end
+
+function _prepare_integrator(d, prob::DDEProblem, p, dt, reset)
+    dt <= minimum(prob.constant_lags) || throw(ArgumentError("step must not exceed the smallest lag"))
+    if d.integrator !== nothing && reset === nothing
+        old = d.integrator
+        # Retain the complete solver, including its history, across stop/restart.
+        old.p == p || throw(ArgumentError("reset_state! before changing DDE parameters"))
+        h = d.delay_window
+        dt == h.dt || throw(ArgumentError("reset_state! before changing the DDE timestep"))
+        return old, h
+    end
+    prepared = remake(prob; u0=copy(d.state.u), p=copy(p), tspan=(d.state.t, Inf))
+    h = d.delay_window
+    # Propagated discontinuities can be one floating-point increment from a grid point.
+    integ = init(prepared, d.alg; dt, dtmax=dt, dtmin=0.0, adaptive=true, abstol=h.abstol,
+        reltol=h.reltol, save_on=false, save_start=false, save_end=false,
+        save_everystep=false, dense=false, maxiters=typemax(Int))
+    h.start, h.dt, h.steps = d.state.t, dt, 0
+    integ, h
 end
 
 # SciMLBase 3 renamed this public operation; retain the 2.116 API as well.
@@ -158,6 +290,13 @@ end
 function _apply_controls!(r::AudioRenderer, c)
     integ = r.integrator
     p = @atomic c.p
+    if r.history !== nothing && (@atomic c.ts) != r.timescale
+        throw(ArgumentError("stop, reset_state!, and prepare! to change the DDE timestep"))
+    end
+    if r.history !== nothing && (@atomic c.reset) === nothing &&
+            p != integ.p
+        throw(ArgumentError("reset_state! before changing DDE parameters or timestep"))
+    end
     if p !== r.parameters
         copyto!(integ.p, p)
         _parameters_changed!(integ)
@@ -172,14 +311,20 @@ function _apply_controls!(r::AudioRenderer, c)
     if reset !== nothing
         reset = @atomicswap c.reset = nothing
         if reset !== nothing
-            reinit!(integ, reset; t0=0.0, tf=Inf, reset_dt=false)
+            t0 = Float64(first(integ.sol.prob.tspan))
+            reinit!(integ, reset; t0, tf=Inf, reset_dt=false)
+            if r.history !== nothing
+                r.history.start = t0
+                r.history.steps = 0
+                r.history.dt = r.timescale / r.sample_rate / r.substeps
+            end
             r.failed = false
         end
     end
     nothing
 end
 
-function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::Int)
+function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::Int, observe=nothing)
     _apply_controls!(r, c)
     if r.failed
         fill!(out, 0.0f0)
@@ -192,10 +337,15 @@ function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::
     index = firstindex(out)
     # Sample before stepping, matching upstream's save_start=true.
     for _ in 1:(length(out) ÷ nch)
+        observed = observe === nothing ? nothing : observe(integ.u, integ.p, integ.t, _history(r.history, integ))
         @inbounds for ch in 1:nch
             sample = 0.0
-            @simd for k in 1:nvars
-                sample += G[k, ch] * integ.u[k]
+            if observed === nothing
+                @simd for k in 1:nvars
+                    sample += G[k, ch] * integ.u[k]
+                end
+            else
+                sample = observed[ch]
             end
             value = Float32(gain * sample)
             if !isfinite(value)
@@ -207,24 +357,22 @@ function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::
             index += 1
         end
         for _ in 1:r.substeps
-            previous_t = integ.t
-            step!(integ)
-            if !(integ.t > previous_t) || !all(isfinite, integ.u) ||
-                    !successful_retcode(check_error(integ))
+            if !_advance!(r.history, integ)
                 r.failed = true
                 fill!(out, 0.0f0)
                 return nothing
             end
         end
     end
+    _trim_history!(r.history, integ)
     nothing
 end
 
 """
     prepare!(source; sample_rate=48000.0, buffer_size=256, substeps=1)
 
-Prepare a stopped source without opening a device. Take `substeps` fixed
-integration steps per audio sample; allocate solver and audio storage here.
+Prepare a stopped source without opening a device. ODE/SDEs take `substeps`
+fixed steps per sample. DDEs use adaptive steps ending on the same time grid.
 """
 function prepare!(source::DESource; sample_rate::Real=48000.0,
         buffer_size::Integer=256, substeps::Integer=1, n_channels::Integer=size(
@@ -241,17 +389,15 @@ function prepare!(source::DESource; sample_rate::Real=48000.0,
     _save_state!(d)
     reset = @atomicswap d.control.reset = nothing
     if reset !== nothing
-        d.state.t = 0.0
+        d.state.t = Float64(first(d.problem.tspan))
         copyto!(d.state.u, reset)
     end
     p = @atomic d.control.p
     ts = @atomic d.control.ts
-    prob = remake(d.problem; u0=copy(d.state.u), p=copy(p), tspan=(d.state.t, Inf))
-    integ = init(prob, d.alg; dt=ts / sample_rate / substeps,
-        adaptive=false, save_on=false, save_start=false, save_end=false,
-        save_everystep=false, dense=false, save_noise=false, maxiters=typemax(Int))
+    integ, history = _prepare_integrator(d, d.problem, p, ts / sample_rate / substeps, reset)
+    d.delay_window = history
     d.integrator = integ
-    d.renderer = AudioRenderer(integ, p, sample_rate, ts, Int(substeps), false)
+    d.renderer = AudioRenderer(integ, history, p, sample_rate, ts, Int(substeps), false)
     d.stream_data.sample_rate = sample_rate
     d.stream_data.buffer_size = buffer_size
     d.stream_data.n_channels = n_channels
@@ -260,18 +406,20 @@ function prepare!(source::DESource; sample_rate::Real=48000.0,
 end
 
 """
-    render!(out::AbstractVector{Float32}, source)
+    render!(out::AbstractVector{Float32}, source; observe=nothing)
 
 Fill caller-owned interleaved audio using a prepared, stopped source. Controls
 apply once per block. Solver failure silences output until reset or preparation.
+Optional observe(u,p,t,h) returns channel values in place of the channel map;
+h is SciML's history function for DDEs and nothing for ODE/SDEs.
 """
-function render!(out::AbstractVector{Float32}, source::DESource)
+function render!(out::AbstractVector{Float32}, source::DESource; observe=nothing)
     d = source.data
     d.running[] && throw(ArgumentError("offline rendering requires a stopped source"))
     d.renderer === nothing && throw(ArgumentError("call prepare! before render!"))
     nch = Int(d.stream_data.n_channels)
     length(out) % nch == 0 || throw(DimensionMismatch("output must contain whole frames"))
-    _render_block!(out, d.renderer, d.control, nch)
+    _render_block!(out, d.renderer, d.control, nch, observe)
     out
 end
 

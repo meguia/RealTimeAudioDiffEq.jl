@@ -276,3 +276,5 @@ end
     @test received == Float32.(1:total)
     @test RT.rb_is_empty(rb)
 end
+
+include("dde.jl")
