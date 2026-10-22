@@ -3,10 +3,7 @@
 Real-time audio from ordinary and stochastic differential equations (ODEs and
 SDEs), using SciML's persistent integrator interface.
 
-This branch, `feature/integrator-interface-audio`, is the first proposed change
-from upstream. It keeps the package layout and public controls while replacing
-per-block solving with an initialized integrator advanced by `step!`. DDE
-support belongs to the separate `feature/sciml-delay-audio` branch.
+This branch replaces per-block solving with an initialized integrator advanced by `step!`.
 
 ## Install and run
 
@@ -59,8 +56,6 @@ control or promise compatibility with every algorithm.
 The producer reuses its integrator, sample buffer, and typed rendering loop.
 PortAudio's callback copies completed samples from a bounded queue. The
 default four queued blocks provide scheduling headroom and add latency.
-Runtime code remains in `src/rt_DE.jl`; the PortAudio bindings remain in
-`src/libportaudio.jl`.
 
 Channel maps accept variable indices (`0` means silence), lists of indices,
 or a variables-by-channels gain matrix. Controls publish copies and take effect
@@ -98,8 +93,3 @@ tested ODE/SDE rendering and callback paths allocate zero Julia heap bytes.
 Setup, control publication, resets, other algorithms, and allocating user
 equations are outside that claim. Julia GC and operating-system scheduling
 still prevent a hard real-time guarantee.
-
-This branch is based on upstream `f43fe1a` and carries the tested ODE/SDE engine
-from `6ed0773` without the old inactive renderer or subsequent DDE experiments.
-Research scripts, historical implementations, measurements, and reports are
-kept in the separate local backup, not in this branch.
