@@ -6,6 +6,7 @@ using SciMLBase: AbstractDEAlgorithm, AbstractSciMLProblem, DDEProblem, ODEFunct
     successful_retcode, check_error, add_tstop!
 using OrdinaryDiffEqTsit5: Tsit5
 using DelayDiffEq: MethodOfSteps
+import DelayDiffEq
 import OrdinaryDiffEqCore
 using StochasticDiffEq: SOSRA
 using Base.Threads: Atomic
@@ -27,6 +28,7 @@ mutable struct AudioRenderer{I,H}
     timescale::Float64
     substeps::Int
     failed::Bool
+    sample::Vector{Float64}
 end
 
 # Setters publish copies; only the producer mutates the integrator.
@@ -61,6 +63,111 @@ mutable struct DelayWindow
     abstol::Float64
     reltol::Float64
     capacity::Int
+    dtmax::Float64
+    reuse::Bool
+end
+
+struct ReuseHistory{H}
+    initial::H
+    capacity::Int
+end
+(h::ReuseHistory)(args...; kwargs...) = h.initial(args...; kwargs...)
+
+mutable struct HistoryBuffer{T} <: AbstractVector{T}
+    slots::Vector{T}
+    head::Int
+    count::Int
+end
+
+function HistoryBuffer(values::Vector{T}, capacity) where T
+    slots = [deepcopy(first(values)) for _ in 1:capacity]
+    for i in eachindex(values)
+        slots[i] = deepcopy(values[i])
+    end
+    HistoryBuffer{T}(slots, 1, length(values))
+end
+
+Base.size(b::HistoryBuffer) = (b.count,)
+Base.IndexStyle(::Type{<:HistoryBuffer}) = IndexLinear()
+@inline _slot(b::HistoryBuffer, i) = (j = b.head+i-1; j > length(b.slots) ? j-length(b.slots) : j)
+Base.@propagate_inbounds function Base.getindex(b::HistoryBuffer, i::Int)
+    @boundscheck checkbounds(b, i)
+    b.slots[_slot(b, i)]
+end
+Base.@propagate_inbounds function Base.setindex!(b::HistoryBuffer, x, i::Int)
+    @boundscheck checkbounds(b, i)
+    _copy_record!(b.slots[_slot(b, i)], x)
+    b
+end
+
+_copy_record!(dest::Vector{Float64}, src::Vector{Float64}) = copyto!(dest, src)
+function _copy_record!(dest::Vector{Vector{Float64}}, src::Vector{Vector{Float64}})
+    previous = length(dest)
+    resize!(dest, length(src))
+    for j in eachindex(src)
+        if j > previous || length(dest[j]) != length(src[j])
+            dest[j] = copy(src[j])
+        else
+            copyto!(dest[j], src[j])
+        end
+    end
+    dest
+end
+
+# The default append copies before push!; specialize only our own storage.
+function DelayDiffEq.copyat_or_push!(b::HistoryBuffer, i::Int, x)
+    1 <= i <= min(b.count+1, length(b.slots)) || throw(BoundsError(b, i))
+    _copy_record!(b.slots[_slot(b, i)], x)
+    b.count = max(b.count, i)
+    nothing
+end
+
+function Base.resize!(b::HistoryBuffer, n::Integer)
+    0 <= n <= length(b.slots) || throw(BoundsError(b, n))
+    b.count = n
+    n == 0 && (b.head = 1)
+    b
+end
+Base.empty!(b::HistoryBuffer) = resize!(b, 0)
+
+function Base.deleteat!(b::HistoryBuffer, indices::UnitRange{Int})
+    isempty(indices) && return b
+    first(indices) == 1 && last(indices) <= b.count || throw(BoundsError(b, indices))
+    b.head = _slot(b, last(indices)+1)
+    b.count -= length(indices)
+    b
+end
+
+# DelayDiffEq 6.3.1 builds history internally. Only our marked problems use this adapter.
+function DelayDiffEq.build_history_function(
+        prob::DDEProblem{U,T,L,L2,IIP,P,F,H}, alg, rate, reltol, dv; kwargs...
+    ) where {U,T,L,L2,IIP,P,F,H<:ReuseHistory}
+    original = remake(prob; h=prob.h.initial)
+    old = DelayDiffEq.build_history_function(original, alg, rate, reltol, dv; kwargs...).integrator
+    ts = old.sol.t
+    us = HistoryBuffer(old.sol.u, prob.h.capacity)
+    ks = HistoryBuffer(old.sol.k, prob.h.capacity)
+    choices = old.sol.alg_choice
+    sizehint!(ts, prob.h.capacity)
+    choices === nothing || sizehint!(choices, prob.h.capacity)
+    interp = OrdinaryDiffEqCore.InterpolationData(old.sol.interp.f, us, ts, ks,
+        choices, true, old.cache, old.differential_vars, false)
+    sol = SciMLBase.build_solution(old.sol.prob, old.alg, ts, us; dense=true,
+        k=ks, interp, alg_choice=choices, calculate_error=false, stats=old.sol.stats)
+    saved = DelayDiffEq.HistoryODEIntegrator{typeof(old.alg),IIP,typeof(old.u),
+        typeof(old.t),typeof(old.tdir),typeof(old.k),typeof(sol),typeof(old.cache),typeof(dv)}(
+        sol, old.u, old.k, old.t, old.dt, old.uprev, old.tprev, old.alg,
+        old.dtcache, old.tdir, old.saveiter, old.saveiter_dense, old.cache, dv)
+    DelayDiffEq.HistoryFunction(prob.h, saved)
+end
+
+function _reserve_history!(integ)
+    records = integ.integrator.sol.k
+    records isa HistoryBuffer || return nothing
+    for i in (length(records)+1):length(records.slots)
+        _copy_record!(records.slots[_slot(records, i)], integ.k)
+    end
+    nothing
 end
 
 mutable struct RealTimeAudioDEData
@@ -166,16 +273,20 @@ end
 """
     DESource(problem::DDEProblem; alg=MethodOfSteps(Tsit5()), max_delay,
              channel_map=[1, 1], abstol=1e-12, reltol=1e-10,
-             history_capacity=100_000)
+             history_capacity=100_000, dtmax=nothing, reuse_history=true)
 
 Use DelayDiffEq's solver and interpolation with a rolling history window.
 Supports in-place Float64 equations with positive constant lags; neutral
-equations currently require one lag. Adaptive DDE rendering allocates in SciML;
+equations currently require one lag. History records are preallocated and reused;
 history_capacity limits retained interpolation knots; exhaustion silences output.
+Set reuse_history=false to use the original allocating history storage.
+With dtmax, sample the native interpolant between adaptive steps and stop at block
+boundaries. Without it, limit steps to the audio substep grid.
 """
 function DESource(prob::DDEProblem; alg=MethodOfSteps(Tsit5()),
         max_delay::Real=maximum(prob.constant_lags; init=0.0), channel_map=[1, 1],
-        abstol::Real=1e-12, reltol::Real=1e-10, history_capacity::Integer=100_000)
+        abstol::Real=1e-12, reltol::Real=1e-10, history_capacity::Integer=100_000,
+        dtmax::Union{Nothing,Real}=nothing, reuse_history::Bool=true)
     SciMLBase.isinplace(prob) || throw(ArgumentError("DDE dynamics must be in-place"))
     prob.u0 isa Vector{Float64} && prob.p isa Vector{Float64} ||
         throw(ArgumentError("DDE state and parameters must be Float64 vectors"))
@@ -194,9 +305,11 @@ function DESource(prob::DDEProblem; alg=MethodOfSteps(Tsit5()),
     all(x -> isfinite(x) && x > 0, (abstol, reltol)) ||
         throw(ArgumentError("DDE tolerances must be finite and positive"))
     history_capacity >= 4 || throw(ArgumentError("history_capacity must be at least four"))
+    dtmax === nothing || (isfinite(dtmax) && 0 < dtmax <= minimum(lags)) ||
+        throw(ArgumentError("dtmax must be positive and no greater than the smallest lag"))
     owned = remake(prob; u0=copy(prob.u0), p=copy(prob.p), constant_lags=lags)
     window = DelayWindow(Float64(max_delay), Float64(first(prob.tspan)), NaN, 0,
-        Float64(abstol), Float64(reltol), Int(history_capacity))
+        Float64(abstol), Float64(reltol), Int(history_capacity), dtmax === nothing ? 0.0 : Float64(dtmax), reuse_history)
     _DESource(owned, alg, channel_map; delay_window=window)
 end
 
@@ -208,7 +321,7 @@ _trim_history!(::Nothing, integ) = nothing
 function _trim_history!(h::DelayWindow, integ)
     saved = integ.integrator
     sol = saved.sol
-    remove = min(searchsortedfirst(sol.t, integ.t - h.max_delay) - 3,
+    remove = min(searchsortedfirst(sol.t, min(integ.t, h.start + h.steps*h.dt) - h.max_delay) - 3,
         integ.prev_idx - 1, integ.prev2_idx - 1)
     if remove > 0
         deleteat!(sol.t, 1:remove)
@@ -235,9 +348,8 @@ end
 
 function _advance!(h::DelayWindow, integ)
     target = h.start + (h.steps + 1) * h.dt
-    target > integ.t || return false
-    add_tstop!(integ, target)
-    tolerance = 16eps(max(abs(target), 1.0))
+    h.dtmax == 0 && target <= integ.t && return false
+    h.dtmax == 0 && add_tstop!(integ, target)
     while integ.t < target
         if length(integ.integrator.sol.t) >= h.capacity
             _trim_history!(h, integ)
@@ -249,7 +361,7 @@ function _advance!(h::DelayWindow, integ)
             successful_retcode(check_error(integ)) || return false
     end
     h.steps += 1
-    abs(integ.t - target) <= tolerance
+    h.dtmax > 0 || abs(integ.t - target) <= 16eps(max(abs(target), 1.0))
 end
 
 function _prepare_integrator(d, prob, p, dt, reset)
@@ -272,10 +384,12 @@ function _prepare_integrator(d, prob::DDEProblem, p, dt, reset)
     end
     prepared = remake(prob; u0=copy(d.state.u), p=copy(p), tspan=(d.state.t, Inf))
     h = d.delay_window
-    # Propagated discontinuities can be one floating-point increment from a grid point.
-    integ = init(prepared, d.alg; dt, dtmax=dt, dtmin=0.0, adaptive=true, abstol=h.abstol,
+    h.reuse && (prepared = remake(prepared; h=ReuseHistory(prob.h, h.capacity)))
+    maximum_step = h.dtmax > 0 ? h.dtmax : dt
+    integ = init(prepared, d.alg; dt, dtmax=maximum_step, dtmin=0.0, adaptive=true, abstol=h.abstol,
         reltol=h.reltol, save_on=false, save_start=false, save_end=false,
         save_everystep=false, dense=false, maxiters=typemax(Int))
+    _reserve_history!(integ)
     h.start, h.dt, h.steps = d.state.t, dt, 0
     integ, h
 end
@@ -335,14 +449,26 @@ function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::
     integ = r.integrator
     nvars = length(integ.u)
     index = firstindex(out)
+    h = r.history
+    interpolated = h !== nothing && h.dtmax > 0
+    if interpolated && !isempty(out)
+        add_tstop!(integ, h.start + (h.steps + length(out) ÷ nch*r.substeps)*h.dt)
+    end
     # Sample before stepping, matching upstream's save_start=true.
     for _ in 1:(length(out) ÷ nch)
-        observed = observe === nothing ? nothing : observe(integ.u, integ.p, integ.t, _history(r.history, integ))
+        sample_time = interpolated ? h.start + h.steps*h.dt : integ.t
+        state = if interpolated
+            integ.history(r.sample, integ.p, sample_time)
+            r.sample
+        else
+            integ.u
+        end
+        observed = observe === nothing ? nothing : observe(state, integ.p, sample_time, _history(h, integ))
         @inbounds for ch in 1:nch
             sample = 0.0
             if observed === nothing
                 @simd for k in 1:nvars
-                    sample += G[k, ch] * integ.u[k]
+                    sample += G[k, ch] * state[k]
                 end
             else
                 sample = observed[ch]
@@ -372,7 +498,8 @@ end
     prepare!(source; sample_rate=48000.0, buffer_size=256, substeps=1)
 
 Prepare a stopped source without opening a device. ODE/SDEs take `substeps`
-fixed steps per sample. DDEs use adaptive steps ending on the same time grid.
+fixed steps per sample. DDEs use adaptive steps. An explicit dtmax samples their native interpolant;
+otherwise steps end on the audio substep grid.
 """
 function prepare!(source::DESource; sample_rate::Real=48000.0,
         buffer_size::Integer=256, substeps::Integer=1, n_channels::Integer=size(
@@ -397,7 +524,7 @@ function prepare!(source::DESource; sample_rate::Real=48000.0,
     integ, history = _prepare_integrator(d, d.problem, p, ts / sample_rate / substeps, reset)
     d.delay_window = history
     d.integrator = integ
-    d.renderer = AudioRenderer(integ, history, p, sample_rate, ts, Int(substeps), false)
+    d.renderer = AudioRenderer(integ, history, p, sample_rate, ts, Int(substeps), false, copy(integ.u))
     d.stream_data.sample_rate = sample_rate
     d.stream_data.buffer_size = buffer_size
     d.stream_data.n_channels = n_channels

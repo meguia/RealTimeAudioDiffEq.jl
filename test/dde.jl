@@ -22,7 +22,7 @@ end
         p = [alg.alg isa Rodas5P ? 1e4 : 1.0, 0.137]
         prob = DDEProblem(f, [sin(t0)], initial_history, (t0, 10.0), p;
             constant_lags=(p[2],), neutral)
-        source = DESource(prob; alg, channel_map=[1])
+        source = DESource(prob; alg, channel_map=[1], history_capacity=512)
         prepare!(source; sample_rate=400, buffer_size=64, substeps=2)
         ref = init(remake(prob; tspan=(t0, Inf)), alg; dt, dtmax=dt, dtmin=0.0, adaptive=true,
             abstol=1e-12, reltol=1e-10,
@@ -91,7 +91,7 @@ end
     p = [0.4,0.1]
     prob = DDEProblem(echo!, [0.0], history, (0.0,100.0), p;
         constant_lags=(p[2],), neutral=true)
-    source = DESource(prob; channel_map=[1])
+    source = DESource(prob; channel_map=[1], history_capacity=512)
     prepare!(source; sample_rate=400, buffer_size=40)
     buffer = zeros(Float32,40)
     retained = Int[]

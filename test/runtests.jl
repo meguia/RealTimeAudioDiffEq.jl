@@ -278,3 +278,7 @@ end
 end
 
 include("dde.jl")
+
+include("dde_sampling.jl")
+
+include("dde_reuse.jl")
