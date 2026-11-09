@@ -1,6 +1,7 @@
 using DelayDiffEq: MethodOfSteps
-using SciMLBase: DDEProblem, init, step!
+using SciMLBase: DDEProblem, init, step!, derivative_discontinuity!
 
+vd_lag(u, p, t) = p[1]
 vd_constant_history(p, t; idxs=nothing) = idxs === nothing ? [0.5] : 0.5
 vd_sine_history(p, t; idxs=nothing) = idxs === nothing ? [sin(8t)] : sin(8t)
 vd_sine_history(p, t, ::Type{Val{1}}; idxs=nothing) =
@@ -27,27 +28,28 @@ end
 const VD_SCHEDULE = ((1.0, 0.2, 0.6, 1.2), (4.0, 0.6, 0.1, 1.5),
     (8.0, 0.1, 0.7, 1.8), (12.0, 0.7, 0.2, 1.5))
 
-function vd_reference_lag(u, p, t)
+function vd_scheduled_lag(u, p, t)
     value = 0.2
     for (origin, before, after, duration) in VD_SCHEDULE
         t < origin && return value
         if t < origin+duration
             x = (t-origin)/duration
-            return before + (after-before)*(3x^2-2x^3)
+            return clamp(before + (after-before)*(3x^2-2x^3), min(before, after), max(before, after))
         end
         value = after
     end
     value
 end
 
-struct VDReference{F}
-    f::F
+struct VDWithLag{F,L}
+    equation::F
+    lag::L
     parameters::Vector{Float64}
 end
 
-function (f::VDReference)(du, u, h, p, t)
-    f.parameters[1] = vd_reference_lag(u, p, t)
-    f.f(du, u, h, f.parameters, t)
+function (f::VDWithLag)(du, u, h, p, t)
+    f.parameters[1] = f.lag(u, p, t)
+    f.equation(du, u, h, f.parameters, t)
 end
 
 function vd_advance_reference!(integ, target)
@@ -59,10 +61,11 @@ function vd_advance_reference!(integ, target)
     end
 end
 
-@testset "Bounded variable-delay validation and ownership" begin
+@testset "External delay validation and ownership" begin
     p = [0.5]
-    prob = DDEProblem(vd_cubic!, [0.52], vd_constant_history, (0.0, 20.0), p)
-    options = (delay_parameter=1, min_delay=0.1, max_delay=0.7,
+    prob = DDEProblem(vd_cubic!, [0.52], vd_constant_history, (0.0, 20.0), p;
+        dependent_lags=(vd_lag,))
+    options = (min_delay=0.1, max_delay=0.7,
         dtmax=0.01, history_capacity=256, channel_map=[1])
     source = DESource(prob; options...)
     @test isempty(source.data.problem.constant_lags)
@@ -72,37 +75,49 @@ end
     for bad in ((min_delay=0.0,), (min_delay=-0.1,), (min_delay=NaN,),
             (max_delay=Inf,), (max_delay=0.4,), (min_delay=0.6,),
             (min_delay=nothing,), (max_delay=nothing,), (dtmax=0.11,),
-            (delay_smoothing=0.0,), (delay_smoothing=NaN,),
-            (discontinuity_capacity=3,), (delay_parameter=0,), (delay_parameter=2,))
+            (discontinuity_capacity=3,))
         @test_throws ArgumentError DESource(remake(prob; p=[0.5]); merge(options, bad)...)
     end
-    @test_throws ArgumentError DESource(remake(prob; constant_lags=(0.4,)); options...)
-    @test_throws ArgumentError DESource(remake(prob; constant_lags=(0.5, 0.6)); options...)
-    @test_throws ArgumentError DESource(remake(prob; dependent_lags=((u,p,t)->p[1],)); options...)
-    @test_throws ArgumentError DESource(remake(prob; p=[0.5]); options..., alg=MethodOfSteps(Rodas5P()))
+    @test_throws ArgumentError DESource(remake(prob; constant_lags=(0.5,)); options...)
+    @test_throws ArgumentError DESource(remake(prob; dependent_lags=(vd_lag, vd_lag)); options...)
+    @test_throws ArgumentError DESource(prob; options..., alg=MethodOfSteps(Rodas5P()))
     for value in (0.0, 0.099, 0.701, Inf, NaN)
+        @test_throws ArgumentError DESource(remake(prob; p=[value]); options...)
+    end
+    for value in (Inf, NaN)
         @test_throws ArgumentError set_param!(source, 1, value)
         @test get_param(source, 1) == 0.5
     end
     @test_throws ArgumentError prepare!(source; sample_rate=5)
     for value in (0.1, 0.7)
         set_param!(source, 1, value)
-        @test get_param(source, 1) == value
+        prepare!(source; sample_rate=200)
+        render!(zeros(Float32, 20), source)
+        @test source.data.integrator.p[1] == value
+        @test !source.data.renderer.failed
     end
+    set_param!(source, 1, 0.8)
+    @test_throws ArgumentError render!(zeros(Float32, 20), source)
+
+    late_lag(u, p, t) = t < 0.05 ? 0.5 : 0.8
+    late_prob = DDEProblem(VDWithLag(vd_cubic!, late_lag, [0.5]), [0.52],
+        vd_constant_history, (0.0, 1.0), [0.5]; dependent_lags=(late_lag,))
+    late = DESource(late_prob; options...)
+    prepare!(late; sample_rate=1000)
+    @test_throws ArgumentError render!(zeros(Float32, 100), late)
 end
 
-@testset "Moving cubic and neutral delays match unbounded native integration" begin
+@testset "External cubic and neutral delays match unbounded native integration" begin
     for neutral in (false, true)
         f = neutral ? vd_neutral! : vd_cubic!
         history = neutral ? vd_sine_history : vd_constant_history
         initial = neutral ? [0.0] : [0.52]
-        prob = DDEProblem(f, initial, history, (0.0, 20.0), [0.2];
-            constant_lags=(0.2,), neutral)
-        source = DESource(prob; delay_parameter=1, min_delay=0.1, max_delay=0.7,
-            delay_smoothing=0.05, dtmax=0.01, history_capacity=256, channel_map=[1])
+        prob = DDEProblem(VDWithLag(f, vd_scheduled_lag, [0.2]), initial, history,
+            (0.0, Inf), [0.2]; dependent_lags=(vd_scheduled_lag,), neutral)
+        source = DESource(prob; min_delay=0.1, max_delay=0.7,
+            dtmax=0.01, history_capacity=256, channel_map=[1])
         prepare!(source; sample_rate=200, buffer_size=20)
-        reference = DDEProblem(VDReference(f, [0.2]), copy(initial), history,
-            (0.0, Inf), [0.2]; dependent_lags=(vd_reference_lag,), neutral)
+        reference = remake(prob; f=VDWithLag(f, vd_scheduled_lag, [0.2]))
         ref = init(reference, MethodOfSteps(RT.Tsit5()); dt=1/200, dtmax=0.01,
             dtmin=0.0, adaptive=true, abstol=1e-12, reltol=1e-10,
             save_on=false, save_start=false, save_end=false, save_everystep=false,
@@ -111,9 +126,6 @@ end
         retained = source.data.integrator
         slots = objectid.(retained.integrator.sol.u.slots)
         for block in 0:159
-            for (time, _, target, _) in VD_SCHEDULE
-                block == round(Int, 10time) && set_param!(source, 1, target)
-            end
             render!(out, source)
             vd_advance_reference!(ref, (block+1)/10)
             @test source.data.integrator === retained
@@ -145,10 +157,11 @@ vd_parameter_history(out, p, t) = (fill!(out, p[1]); nothing)
 vd_history_rhs!(du, u, h, p, t) = (du[1] = h(p, t-p[1]; idxs=1); nothing)
 vd_history_inplace_rhs!(du, u, h, p, t) = (h(du, p, t-p[1]); nothing)
 
-@testset "Initial history stays fixed while tau changes" begin
-    for f in (vd_history_rhs!, vd_history_inplace_rhs!)
-        prob = DDEProblem(f, [0.5], vd_parameter_history, (0.0, 5.0), [0.5])
-        source = DESource(prob; delay_parameter=1, min_delay=0.5, max_delay=1.0,
+@testset "Initial history stays fixed until reset" begin
+    for f in (vd_history_rhs!, vd_history_inplace_rhs!), reuse_history in (false, true)
+        prob = DDEProblem(f, [0.5], vd_parameter_history, (0.0, 5.0), [0.5];
+            dependent_lags=(vd_lag,))
+        source = DESource(prob; min_delay=0.5, max_delay=1.0, reuse_history,
             dtmax=0.02, history_capacity=128, channel_map=[1])
         prepare!(source; sample_rate=400, buffer_size=20)
         out = zeros(Float32, 20)
@@ -166,10 +179,11 @@ end
 
 vd_observe_delay(u, p, t, h) = (p[1],)
 
-@testset "Delay controls remain continuous across retarget, prepare and reset" begin
-    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 10.0), [0.2, 1.0])
-    source = DESource(prob; delay_parameter=1, min_delay=0.1, max_delay=0.7,
-        delay_smoothing=0.05, dtmax=0.01, history_capacity=256, channel_map=[1])
+@testset "Parameter updates have no implicit smoothing" begin
+    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 10.0), [0.2, 1.0];
+        dependent_lags=(vd_lag,))
+    source = DESource(prob; min_delay=0.1, max_delay=0.7,
+        dtmax=0.01, history_capacity=256, channel_map=[1])
     prepare!(source; sample_rate=200, buffer_size=20)
     retained = source.data.integrator
     out = zeros(Float32, 20)
@@ -177,43 +191,66 @@ vd_observe_delay(u, p, t, h) = (p[1],)
     prepare!(source; sample_rate=200, buffer_size=20)
     @test source.data.integrator === retained
     render!(out, source; observe=vd_observe_delay)
-    @test out[1] ≈ 0.2f0
-    @test 0.2 < out[end] < 0.7
-    @test all(>=(0), diff(out))
-    current = RT._delay_value(source.data.delay_window.delay, retained.t)
+    @test all(==(0.7f0), out)
     set_param!(source, 1, 0.1)
     render!(out, source; observe=vd_observe_delay)
-    @test out[1] ≈ Float32(current)
-    @test all(<=(0), diff(out))
-    @test all(x -> 0.1 <= x <= 0.7, out)
+    @test all(==(0.1f0), out)
+    set_param!(source, 2, 2.0)
+    render!(out, source)
+    @test !source.data.renderer.failed
+    @test retained.p[2] == 2.0
     reset_state!(source)
     render!(Float32[], source)
     @test retained.t == 0.0
     @test length(retained.integrator.sol.t) == 1
     render!(out, source; observe=vd_observe_delay)
     @test all(==(0.1f0), out)
-    set_param!(source, 2, 2.0)
-    @test_throws ArgumentError render!(out, source)
-    reset_state!(source)
-    render!(out, source)
-    @test !source.data.renderer.failed
 end
 
-@testset "Delay smoothing uses audio seconds" begin
-    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 5.0), [0.2])
-    source = DESource(prob; delay_parameter=1, min_delay=0.1, max_delay=0.3,
-        delay_smoothing=0.05, dtmax=0.01, history_capacity=128, channel_map=[1])
-    set_ts!(source, 20.0)
-    prepare!(source; sample_rate=1000, buffer_size=25)
-    set_param!(source, 1, 0.21)
-    out = zeros(Float32, 25)
-    render!(out, source; observe=vd_observe_delay)
-    @test out[1] ≈ 0.2f0
-    render!(out, source; observe=vd_observe_delay)
-    @test out[1] ≈ 0.205f0
-    render!(out, source; observe=vd_observe_delay)
-    @test all(==(0.21f0), out)
-    @test !source.data.renderer.failed
+mutable struct VDExternalRamp
+    position::Float64
+    origin::Float64
+    rate::Int
+end
+function (r::VDExternalRamp)(u, p, t)
+    x = clamp((r.position+r.rate*(t-r.origin))/0.1, 0.0, 1.0)
+    0.2 + 0.4*x*x*(3-2x)
+end
+function vd_rate!(r, integ, rate)
+    r.position = clamp(r.position+r.rate*(integ.t-r.origin), 0.0, 0.1)
+    r.origin, r.rate = integ.t, rate
+    derivative_discontinuity!(integ, true)
+end
+
+@testset "Application smoothing can pause and reverse without a second ramp" begin
+    ramp = VDExternalRamp(0.0, 0.0, 1)
+    prob = DDEProblem(VDWithLag(vd_neutral!, ramp, [0.2]), [0.0],
+        vd_sine_history, (0.0, Inf), [0.2]; dependent_lags=(ramp,), neutral=true)
+    source = DESource(prob; min_delay=0.1, max_delay=0.7,
+        dtmax=0.002, history_capacity=512, channel_map=[1])
+    prepare!(source; sample_rate=1000, buffer_size=10)
+    integ = source.data.integrator
+    out = zeros(Float32, 10)
+    observe(u, p, t, h) = (ramp(u, p, t),)
+    for (rate, blocks) in ((1, 4), (0, 2), (-1, 3), (1, 10))
+        vd_rate!(ramp, integ, rate)
+        render!(Float32[], source)
+        @test any(e -> e.t == integ.t && e.order <= 1, integ.tracked_discontinuities)
+        events = length(integ.tracked_discontinuities)
+        derivative_discontinuity!(integ, true)
+        render!(Float32[], source)
+        @test length(integ.tracked_discontinuities) == events
+        for _ in 1:blocks
+            t0 = integ.t
+            expected = Float32[ramp(integ.u, integ.p, t0+(j-1)/1000) for j in 1:10]
+            render!(out, source; observe)
+            @test out ≈ expected atol=2e-7
+            @test integ.u[1] ≈ sin(8integ.t) atol=3e-6
+            @test !source.data.renderer.failed
+        end
+    end
+    @test out[end] == 0.6f0
+    @test integ.p == [0.2]
 end
 
 function vd_render_bytes!(source, out, repetitions)
@@ -231,46 +268,38 @@ function vd_cycle_bytes!(source, out, cycles)
     bytes
 end
 
-@testset "Moving-delay rendering reuses storage" begin
-    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 100.0), [0.5])
-    source = DESource(prob; delay_parameter=1, min_delay=0.5, max_delay=4.0,
-        dtmax=0.01, history_capacity=2048, channel_map=[1])
+@testset "External moving delay reuses history storage" begin
+    lag(u, p, t) = 0.55 + 0.05sin(t)
+    prob = DDEProblem(VDWithLag(vd_sine!, lag, [0.5]), [0.0], vd_sine_history,
+        (0.0, Inf), [0.5]; dependent_lags=(lag,))
+    source = DESource(prob; min_delay=0.5, max_delay=0.7,
+        dtmax=0.01, history_capacity=256, channel_map=[1])
     prepare!(source; sample_rate=1000, buffer_size=16)
     out = zeros(Float32, 16)
-    empty = Float32[]
-    set_param!(source, 1, 0.6)
-    vd_render_bytes!(source, empty, 1)
-    set_param!(source, 1, 0.5)
-    reset_state!(source)
-    vd_render_bytes!(source, empty, 1)
     vd_render_bytes!(source, out, 300)
-    set_param!(source, 1, 4.0)
-    @test vd_render_bytes!(source, empty, 1) == 0
-    vd_render_bytes!(source, out, 50)
     @test vd_render_bytes!(source, out, 50) == 0
     @test !source.data.renderer.failed
-    delay = source.data.delay_window.delay
-    @test delay.origin < source.data.integrator.t < delay.origin+delay.duration
 end
 
-@testset "Completed delay ramps preserve reusable event storage" begin
-    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 100.0), [0.5])
-    source = DESource(prob; delay_parameter=1, min_delay=0.5, max_delay=0.7,
+@testset "Repeated controls preserve reusable event storage" begin
+    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, Inf), [0.5];
+        dependent_lags=(vd_lag,))
+    source = DESource(prob; min_delay=0.5, max_delay=0.7,
         dtmax=0.01, history_capacity=256, channel_map=[1])
     prepare!(source; sample_rate=1000, buffer_size=16)
     out = zeros(Float32, 16)
     vd_cycle_bytes!(source, out, 20)
     @test vd_cycle_bytes!(source, out, 20) == 0
     @test !source.data.renderer.failed
-    delay = source.data.delay_window.delay
-    @test source.data.integrator.t >= delay.origin+delay.duration
-    @test RT._delay_value(delay, source.data.integrator.t) ≈ 0.5
+    @test all(e -> e.t >= source.data.integrator.t-0.7,
+        source.data.integrator.tracked_discontinuities)
 end
 
 @testset "Variable-delay capacity exhaustion silences output" begin
-    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 5.0), [0.5])
+    prob = DDEProblem(vd_sine!, [0.0], vd_sine_history, (0.0, 5.0), [0.5];
+        dependent_lags=(vd_lag,))
     for (history_capacity, discontinuity_capacity) in ((4, 32), (512, 4))
-        source = DESource(prob; delay_parameter=1, min_delay=0.1, max_delay=1.0,
+        source = DESource(prob; min_delay=0.1, max_delay=1.0,
             dtmax=0.01, history_capacity, discontinuity_capacity, channel_map=[1])
         prepare!(source; sample_rate=1000, buffer_size=10)
         out = ones(Float32, 10)
