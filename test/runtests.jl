@@ -109,7 +109,7 @@ end
 end
 
 @testset "Control updates reach the integrator at block boundaries" begin
-    # A constant derivative makes stale FSAL caches and delayed dt changes visible.
+    # Detect stale derivatives after control changes.
     for stochastic in (false, true)
         s = stochastic ? DESource(drift!, zero_noise!, [0.0], [1.0]; channel_map=[1]) :
             DESource(drift!, [0.0], [1.0]; channel_map=[1])
@@ -156,7 +156,7 @@ end
     out = zeros(Float32, 900)
     callback!(s, out)
     @test out == Float32.(1:900)
-    # Both source and destination wrap; 1024 is not divisible by three channels.
+    # Both buffers wrap mid-frame with three channels.
     @test RT.rb_write!(rb, Float32.(901:1500))
     fill!(out, -1)
     callback!(s, out)
@@ -187,7 +187,7 @@ end
     @test isempty(s.data.integrator.sol.t)
     @test length(s.data.integrator.W.t) <= 1
     @test !s.data.integrator.W.save_everystep
-    # Additive Brownian motion: check variance scales with the updated model dt.
+    # Variance follows the updated timestep.
     brownian = DESource(drift!, noise!, [0.0], [0.0, 0.3]; channel_map=[1])
     brownian.data.problem = remake(brownian.data.problem; seed=UInt64(1234))
     prepare!(brownian)
@@ -222,7 +222,7 @@ end
     set_param!(s, 1, 3.0)
     @test (@allocated render!(out, s)) == 0
     before = integrator_info(s).t
-    # Exceed the old fork's default 1e6-step limit without retaining history.
+    # Run past 1e6 steps without retaining history.
     for _ in 1:4000
         render!(out, s)
     end

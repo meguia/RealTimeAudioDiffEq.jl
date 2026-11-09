@@ -11,7 +11,7 @@ import OrdinaryDiffEqCore
 using StochasticDiffEq: SOSRA
 using Base.Threads: Atomic
 
-# One writer per index; publish only after copying complete frames.
+# Single-writer indices; publish complete frames.
 mutable struct RBAudio
     buf::Vector{Float32}
     mask::Int
@@ -19,7 +19,6 @@ mutable struct RBAudio
     r::Atomic{Int}
 end
 
-# The type parameter lets Julia specialize the complete sample loop.
 mutable struct AudioRenderer{I,H}
     integrator::I
     history::H
@@ -31,7 +30,7 @@ mutable struct AudioRenderer{I,H}
     sample::Vector{Float64}
 end
 
-# Setters publish copies; only the producer mutates the integrator.
+# Only the producer mutates the integrator.
 mutable struct RealTimeAudioDEControlData
     @atomic u0::Vector{Float64}
     @atomic p::Vector{Float64}
@@ -114,7 +113,7 @@ function _copy_record!(dest::Vector{Vector{Float64}}, src::Vector{Vector{Float64
     dest
 end
 
-# The default append copies before push!; specialize only our own storage.
+# Reuse records instead of allocating copies.
 function DelayDiffEq.copyat_or_push!(b::HistoryBuffer, i::Int, x)
     1 <= i <= min(b.count+1, length(b.slots)) || throw(BoundsError(b, i))
     _copy_record!(b.slots[_slot(b, i)], x)
@@ -138,7 +137,7 @@ function Base.deleteat!(b::HistoryBuffer, indices::UnitRange{Int})
     b
 end
 
-# DelayDiffEq 6.3.1 builds history internally. Only our marked problems use this adapter.
+# Private DelayDiffEq 6.3.1 history adapter.
 function DelayDiffEq.build_history_function(
         prob::DDEProblem{U,T,L,L2,IIP,P,F,H}, alg, rate, reltol, dv; kwargs...
     ) where {U,T,L,L2,IIP,P,F,H<:ReuseHistory}
@@ -196,7 +195,7 @@ mutable struct DESource
     callback::Base.CFunction
 end
 
-# PortAudio keeps a raw userdata pointer, not a Julia GC root.
+# Keep Julia roots for PortAudio userdata.
 const _active_sources = IdDict{DESource,Nothing}()
 const _active_sources_lock = ReentrantLock()
 
@@ -228,13 +227,7 @@ function normalize_channel_map(channel_map, nvars::Int, nch::Int=
     G
 end
 
-"""
-    DESource(f, u0::Vector{Float64}, p::Vector{Float64}; alg=Tsit5(), channel_map=[1, 1])
-    DESource(f, g, u0::Vector{Float64}, p::Vector{Float64}; alg=SOSRA(), channel_map=[1, 1])
-
-Create an ODE or SDE audio source, copying its inputs. Maps accept variable
-indices (0 means silence), lists of indices, or a variables-by-channels matrix.
-"""
+"""Create an ODE/SDE audio source, copying state and parameters."""
 function DESource(f, u0::Vector{Float64}, p::Vector{Float64};
         alg=Tsit5(), channel_map=[1, 1])
     _DESource(ODEProblem(f, copy(u0), (0.0, 0.01), copy(p)), alg, channel_map)
@@ -271,17 +264,10 @@ end
 
 
 """
-    DESource(problem::DDEProblem; alg=MethodOfSteps(Tsit5()), max_delay,
-             channel_map=[1, 1], abstol=1e-12, reltol=1e-10,
-             history_capacity=100_000, dtmax=nothing, reuse_history=true)
+    DESource(prob::DDEProblem; kwargs...)
 
-Use DelayDiffEq's solver and interpolation with a rolling history window.
-Supports in-place Float64 equations with positive constant lags; neutral
-equations currently require one lag. History records are preallocated and reused;
-history_capacity limits retained interpolation knots; exhaustion silences output.
-Set reuse_history=false to use the original allocating history storage.
-With dtmax, sample the native interpolant between adaptive steps and stop at block
-boundaries. Without it, limit steps to the audio substep grid.
+Constant-lag DDE audio with native interpolation and bounded history.
+Neutral equations require one lag; capacity exhaustion silences output.
 """
 function DESource(prob::DDEProblem; alg=MethodOfSteps(Tsit5()),
         max_delay::Real=maximum(prob.constant_lags; init=0.0), channel_map=[1, 1],
@@ -317,7 +303,6 @@ _history(::Nothing, integ) = nothing
 _history(::DelayWindow, integ) = integ.history
 _trim_history!(::Nothing, integ) = nothing
 
-# DelayDiffEq 6.3.1 storage bookkeeping; interpolation remains entirely in SciML.
 function _trim_history!(h::DelayWindow, integ)
     saved = integ.integrator
     sol = saved.sol
@@ -335,7 +320,7 @@ function _trim_history!(h::DelayWindow, integ)
         sol.interp.ts_hint.idx_prev = max(0, sol.interp.ts_hint.idx_prev - remove)
         OrdinaryDiffEqCore.reprobe_ts_hint!(sol.interp.ts_hint)
     end
-    # Only dependent delays use this log; future constant-lag events stay queued.
+    # Constant-lag events remain queued separately.
     empty!(integ.tracked_discontinuities)
     nothing
 end
@@ -376,7 +361,6 @@ function _prepare_integrator(d, prob::DDEProblem, p, dt, reset)
     dt <= minimum(prob.constant_lags) || throw(ArgumentError("step must not exceed the smallest lag"))
     if d.integrator !== nothing && reset === nothing
         old = d.integrator
-        # Retain the complete solver, including its history, across stop/restart.
         old.p == p || throw(ArgumentError("reset_state! before changing DDE parameters"))
         h = d.delay_window
         dt == h.dt || throw(ArgumentError("reset_state! before changing the DDE timestep"))
@@ -394,7 +378,6 @@ function _prepare_integrator(d, prob::DDEProblem, p, dt, reset)
     integ, h
 end
 
-# SciMLBase 3 renamed this public operation; retain the 2.116 API as well.
 @static if isdefined(SciMLBase, :derivative_discontinuity!)
     _parameters_changed!(integ) = SciMLBase.derivative_discontinuity!(integ, true)
 else
@@ -454,7 +437,6 @@ function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::
     if interpolated && !isempty(out)
         add_tstop!(integ, h.start + (h.steps + length(out) ÷ nch*r.substeps)*h.dt)
     end
-    # Sample before stepping, matching upstream's save_start=true.
     for _ in 1:(length(out) ÷ nch)
         sample_time = interpolated ? h.start + h.steps*h.dt : integ.t
         state = if interpolated
@@ -494,13 +476,7 @@ function _render_block!(out::AbstractVector{Float32}, r::AudioRenderer, c, nch::
     nothing
 end
 
-"""
-    prepare!(source; sample_rate=48000.0, buffer_size=256, substeps=1)
-
-Prepare a stopped source without opening a device. ODE/SDEs take `substeps`
-fixed steps per sample. DDEs use adaptive steps. An explicit dtmax samples their native interpolant;
-otherwise steps end on the audio substep grid.
-"""
+"""Prepare a stopped source without opening audio: fixed ODE/SDE steps, adaptive DDE steps."""
 function prepare!(source::DESource; sample_rate::Real=48000.0,
         buffer_size::Integer=256, substeps::Integer=1, n_channels::Integer=size(
             @atomic(source.data.control.channel_map), 2))
@@ -533,12 +509,8 @@ function prepare!(source::DESource; sample_rate::Real=48000.0,
 end
 
 """
-    render!(out::AbstractVector{Float32}, source; observe=nothing)
-
-Fill caller-owned interleaved audio using a prepared, stopped source. Controls
-apply once per block. Solver failure silences output until reset or preparation.
-Optional observe(u,p,t,h) returns channel values in place of the channel map;
-h is SciML's history function for DDEs and nothing for ODE/SDEs.
+Render interleaved audio from a prepared, stopped source.
+`observe(u,p,t,h)` optionally supplies channel values; `h` is DDE history or `nothing`.
 """
 function render!(out::AbstractVector{Float32}, source::DESource; observe=nothing)
     d = source.data
@@ -585,7 +557,7 @@ function rb_write!(rb::RBAudio, samples::Vector{Float32})
     true
 end
 
-# n and each published block must contain whole frames.
+# Publish and pop whole frames.
 function rb_pop!(rb::RBAudio, out::Ptr{Cfloat}, n::Int)
     r = rb.r[]
     m = min(rb.w[] - r, n)
@@ -596,7 +568,7 @@ function rb_pop!(rb::RBAudio, out::Ptr{Cfloat}, n::Int)
     GC.@preserve storage begin
         unsafe_copyto!(out, pointer(storage, ri + 1), tail)
         if tail < m
-            # Pointer offsets are in bytes.
+            # Pointer offsets are bytes.
             unsafe_copyto!(out + tail * sizeof(Cfloat), pointer(storage), m - tail)
         end
     end
@@ -604,7 +576,6 @@ function rb_pop!(rb::RBAudio, out::Ptr{Cfloat}, n::Int)
     m
 end
 
-# Callback work is limited to copying samples, silence, and counters.
 function _audio_callback!(data::RealTimeAudioDEData, out::Ptr{Cfloat}, frames::Int)
     nch = Int(data.stream_data.n_channels)
     nsamp = frames * nch
@@ -667,13 +638,7 @@ function _produce_audio!(d, renderer::AudioRenderer, rb::RBAudio, target, timer,
     nothing
 end
 
-"""
-    start_DESource(source, output_device; sample_rate=-1.0, buffer_size=0,
-                   substeps=1, queue_blocks=4)
-
-Prepare, prefill, and start playback. Requires Julia with at least two worker
-threads. Default block size: 256 frames. More queued blocks add control latency.
-"""
+"""Start playback; requires at least two Julia threads."""
 function start_DESource(source::DESource, output_device::PaDeviceIndex;
         sample_rate::Real=-1.0, buffer_size::Integer=0,
         substeps::Integer=1, queue_blocks::Integer=4)
@@ -699,7 +664,7 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
             d.pushed_samples, d.solver_failures)
         counter[] = 0
     end
-    # Prefill with the first samples while compiling the audio path.
+    # Warm up before opening audio.
     for _ in 1:queue_blocks
         _produce_block!(d, d.renderer, rb)
     end
@@ -714,7 +679,6 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
         err = Pa_OpenStream(d.stream_data.stream, C_NULL, Ref(params), fs,
             Culong(frames), 0, source.callback, pointer_from_objref(d))
         err == 0 || error(unsafe_string(Pa_GetErrorText(err)))
-        # Reuse one timer instead of allocating on every poll.
         timer = Timer(0; interval=max(0.001, frames / fs / 4))
         ready = Base.Event()
         d.running[] = true
@@ -730,7 +694,7 @@ function start_DESource(source::DESource, output_device::PaDeviceIndex;
     nothing
 end
 
-"""Stop the producer, close PortAudio, and preserve the last rendered solver state."""
+"""Stop playback and preserve the solver state."""
 function stop_DESource(source::DESource)
     d = source.data
     d.running[] = false
@@ -740,7 +704,7 @@ function stop_DESource(source::DESource)
     end
     stream = d.stream_data.stream[]
     if stream != C_NULL
-        # CloseStream waits for the callback before its storage is released.
+        # Wait for callbacks before releasing storage.
         err = Pa_CloseStream(stream)
         err == 0 || error(unsafe_string(Pa_GetErrorText(err)))
         d.stream_data.stream[] = C_NULL
@@ -758,7 +722,7 @@ isactive(source::DESource) = source.data.stream_data.stream[] != C_NULL &&
     Pa_IsStreamActive(source.data.stream_data.stream[]) == 1
 isstopped(source::DESource) = isinitialized(source) && !isactive(source)
 
-"""Set initial conditions used by the next `reset_state!`; does not reset by itself."""
+"""Set the initial state for the next reset."""
 function set_u0!(source::DESource, u::Vector{Float64})
     length(u) == length(source.data.state.u) || throw(DimensionMismatch("u0 length changed"))
     all(isfinite, u) || throw(ArgumentError("initial state must be finite"))
@@ -767,7 +731,7 @@ function set_u0!(source::DESource, u::Vector{Float64})
 end
 get_u0(source::DESource) = copy(@atomic source.data.control.u0)
 
-"""Request a reset to the current `u0` at the next rendered block boundary."""
+"""Request a reset to `u0` at the next block boundary."""
 function reset_state!(source::DESource)
     @atomic source.data.control.reset = copy(@atomic source.data.control.u0)
     nothing
@@ -866,12 +830,10 @@ function probe_integrator!(source::DESource; n=1024, take=16)
     (; changed, first_vals=vals)
 end
 
-"""Get the default audio output device index."""
 function get_default_output_device()::PaDeviceIndex
     return Pa_GetDefaultOutputDevice()
 end
 
-"""Report information about an audio device."""
 function get_device_info(device::PaDeviceIndex)::PaDeviceInfo
     if Pa_GetDeviceInfo(device) == C_NULL
         error("invalid device index.")
@@ -879,7 +841,6 @@ function get_device_info(device::PaDeviceIndex)::PaDeviceInfo
     return unsafe_load(Pa_GetDeviceInfo(device))
 end
 
-"""Return an array of available audio devices."""
 function get_devices()
     devices = []
     for i in 0:Pa_GetDeviceCount() - 1
@@ -894,7 +855,6 @@ function get_devices()
     return devices
 end
 
-"""Print a list of available audio devices."""
 function list_devices()
     for i in 0:Pa_GetDeviceCount() - 1
         device_info = unsafe_load(Pa_GetDeviceInfo(i))
@@ -902,7 +862,6 @@ function list_devices()
     end
 end
 
-"""Get the index of an audio device by its name."""
 function get_device_index(name::String)::PaDeviceIndex
     for i in 0:Pa_GetDeviceCount() - 1
         device_info = unsafe_load(Pa_GetDeviceInfo(i))
