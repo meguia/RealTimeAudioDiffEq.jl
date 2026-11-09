@@ -3,10 +3,10 @@
 Audio from ordinary and stochastic differential equations (ODEs and SDEs),
 with experimental support for ordinary and neutral delay equations (DDEs).
 
-This experimental branch, `feature/sciml-history-reuse`, builds on
-`feature/sciml-delay-audio`. It samples native adaptive interpolation and reuses
-the arrays that store DDE history. Runtime code remains in `src/rt_DE.jl`;
-DelayDiffEq continues to own stepping and interpolation.
+This experimental branch, `feature/sciml-variable-delay-audio`, adds a smoothly
+movable, bounded delay to `feature/sciml-history-reuse`. Runtime code remains in
+`src/rt_DE.jl`; DelayDiffEq owns stepping and interpolation, and its history
+arrays are reused.
 
 **Status:** the ODE/SDE renderer retains its tested zero-allocation paths.
 The DDE renderer preserves SciML's interpolation and adaptive solver. Warmed
@@ -140,7 +140,7 @@ allocation. Tests measure steady behavior after complete buffer wraparound.
 The adapter applies only to problems marked internally by this package and to
 its own history container. It does not replace methods for ordinary DelayDiffEq
 problems or modify the installed SciML packages. It uses private construction
-and bookkeeping interfaces, so this branch pins DelayDiffEq 6.3.1 and
+and bookkeeping interfaces (including native delay-event propagation), so this branch pins DelayDiffEq 6.3.1 and
 OrdinaryDiffEqCore 4.19.0. Changing either requires retesting the adapter.
 Use `reuse_history=false` to compare against the original allocating storage.
 
@@ -155,20 +155,71 @@ and process scheduling can still cause allocations or deadline misses. GC stays
 enabled; this is not a hard real-time guarantee.
 
 The supported scope is in-place equations with `Vector{Float64}` states and
-parameters, identity mass matrix, and declared positive constant lags.
+parameters, identity mass matrix, and positive bounded lags.
 Neutral equations currently support one lag to bound recurring discontinuity
-queues. Ordinary DDEs may declare multiple lags. State-dependent delays,
+queues. Ordinary DDEs may declare multiple constant lags. Arbitrary state-dependent delays,
 callbacks, stochastic DDEs, and queries beyond the declared history window
 are outside this implementation. Supply derivative prehistory for a neutral
 equation, including any incompatibility at the initial time.
 
 Stopping and preparing again retains the complete DDE solver and its history.
-Changing parameters requires `reset_state!`. Changing timescale or step size
+Changing parameters other than an explicitly movable delay requires `reset_state!`. Changing timescale or step size
 requires stopping, resetting, and preparing again. A reset starts a new
-trajectory using the supplied prehistory. Changes to delay values require a
-new problem with matching `constant_lags`. Gain and channel maps can change
-without restarting the trajectory. Continuous parameter automation is not
-yet provided for this DDE path.
+trajectory using the supplied prehistory. Fixed delay values require a new
+problem with matching `constant_lags`; the opt-in mode below permits live delay
+changes. Gain and channel maps can change without restarting the trajectory.
+
+### Moving delay
+
+Set `delay_parameter=k` to control the single delay stored in `p[k]`. The equation
+continues to read `h(p, t-p[k])` (or `h(p, t-p[k], Val{1})` for a neutral DDE).
+The renderer supplies the smoothed value at every solver evaluation and declares
+the same delay function to SciML through `dependent_lags`.
+
+```julia
+function cubic!(du, u, h, p, t)
+    z = h(p, t-p[1]; idxs=1)
+    du[1] = z*(1-z*z)
+end
+past(p, t; idxs=nothing) = idxs === nothing ? [0.5] : 0.5
+problem = DDEProblem(cubic!, [0.52], past, (0.0, Inf), [1.0])
+source = DESource(problem; delay_parameter=1, min_delay=0.5, max_delay=2.0,
+    delay_smoothing=0.05, dtmax=0.0625, history_capacity=8192)
+set_ts!(source, 400)
+set_gain!(source, 0.15)
+# After starting playback, this changes τ without resetting the trajectory:
+set_param!(source, 1, 1.59)
+```
+
+Both bounds are fixed at construction, in model time; out-of-range targets are
+rejected before publication. At timescale 400, τ=1 is a 2.5 ms audio delay.
+`delay_smoothing` is the minimum transition duration in audio seconds. A cubic
+smoothstep joins the current value to the target; large changes take longer to
+keep the delay's model-time slope at most 1/2. Interrupted transitions start
+from the current value. `get_param` returns the target; an `observe` callback
+receives the actual smoothed value. Pre-start history retains its original
+parameters until reset, which starts immediately at the current target.
+
+This mode currently supports `MethodOfSteps(Tsit5())`, one controlled delay,
+and ordinary or neutral DDEs. It keeps native derivative interpolation and
+adaptive error control. Other model parameters still require reset. Set
+`dtmax <= min_delay`; `min_delay/8` is a useful starting resolution, subject to
+accuracy and timing tests for the equation.
+
+`discontinuity_capacity` (default: `history_capacity`) limits the retained
+delay-event log. Old events are removed only when no permitted delay can reach
+them. Exhaustion latches silence until reset, as for history exhaustion. Neutral
+echoes can accumulate under repeated changes, and native solver/event work can
+still allocate or miss an audio deadline; a maximum delay alone is not a
+real-time guarantee.
+
+The [cubic example](example/variable_delay.jl) accepts τ values at the console:
+
+```sh
+julia --threads=2 --project example/variable_delay.jl --devices
+julia --threads=2 --project example/variable_delay.jl 0 # choose an output device index
+julia --project example/variable_delay.jl --offline  # render without opening a device
+```
 
 For offline derived outputs, `render!(buffer, source; observe=f)` calls
 `f(u,p,t,h)` at each sample and uses its returned channel values instead of
